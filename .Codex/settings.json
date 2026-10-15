@@ -1,5 +1,3 @@
 {
-  "validationCommand": "scripts/validate.sh",
-  "gitHooksPath": ".Codex/hooks",
-  "note": "Repository hook metadata; Git core.hooksPath activates pre-commit validation."
+  "validationCommand": "scripts/validate.sh"
 }

@@ -12,5 +12,6 @@ packaging and code conventions in emilypi/base64 and emilypi/base64-lens.
 - Keep tests offline with a local HTTP server. Never require credentials or
   invoke billable inference in tests. Never log bearer tokens.
 - Validate with `scripts/validate.sh`; inspect the source tarball as well.
+- Do not install pre-commit hooks. Run validation explicitly or in CI.
 - Put session plans and evidence in `logs/`; do not include them in the package.
 - Keep examples compilable. Document unsupported API surfaces honestly.
