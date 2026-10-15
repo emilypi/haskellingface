@@ -12,6 +12,8 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Either (isLeft)
 import Data.IORef
 import Data.List (isInfixOf, sort)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.Text.Encoding (encodeUtf8)
 import Data.Text (Text)
 import qualified Data.Text as T
 import HuggingFace
@@ -53,11 +55,14 @@ withFixture reply action = withServer (const (pure reply)) $ \port seen -> do
 clientAt :: Int -> Maybe Token -> IO Client
 clientAt port tokenValue = do
     manager <- newManager defaultManagerSettings {managerRetryableException = const False}
-    expectRight $ newClientWithManager manager defaultClientConfig
-        { hubEndpoint = origin port, inferenceEndpoint = origin port, accessToken = tokenValue }
+    pure $ newClientWithManager manager defaultClientConfig
+        { hubEndpoint = endpointAt port, inferenceEndpoint = endpointAt port, accessToken = tokenValue }
 
-origin :: Int -> String
-origin port = "http://127.0.0.1:" ++ show port
+origin :: Int -> Text
+origin port = "http://127.0.0.1:" <> T.pack (show port)
+
+endpointAt :: Int -> Endpoint
+endpointAt = valid . parseEndpoint . origin
 
 expectRight :: Show e => Either e a -> IO a
 expectRight = either (\err -> assertFailure (show err) >> fail "unreachable") pure
@@ -66,13 +71,13 @@ valid :: Show e => Either e a -> a
 valid = either (error . show) id
 
 token :: Token
-token = valid (mkToken "hf_test_token")
+token = valid (parseToken "hf_test_token")
 
 repository :: RepoId
-repository = valid (mkRepoId "owner/model")
+repository = valid (parseRepoId "owner/model")
 
 repoJSON :: BL.ByteString
-repoJSON = "{\"id\":\"owner/model\",\"sha\":\"abc\",\"private\":false,\"downloads\":42,\"likes\":2,\"siblings\":[{\"rfilename\":\"config.json\",\"size\":17}],\"futureField\":true}"
+repoJSON = "{\"id\":\"owner/model\",\"sha\":\"0123456789abcdef0123456789abcdef01234567\",\"private\":false,\"downloads\":42,\"likes\":2,\"siblings\":[{\"rfilename\":\"config.json\",\"size\":17}],\"futureField\":true}"
 
 chatJSON :: BL.ByteString
 chatJSON = "{\"id\":\"chat-1\",\"model\":\"owner/model\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}"
@@ -82,39 +87,131 @@ jsonReply = (,,) status200 [(hContentType, "application/json")]
 
 main :: IO ()
 main = defaultMain $ testGroup "huggingface"
-    [ identifierTests, hubTests, transportTests, inferenceTests ]
+    [ identifierTests, domainTests, hubTests, transportTests, inferenceTests ]
 
 identifierTests :: TestTree
-identifierTests = testGroup "Validated inputs"
+identifierTests = testGroup "Parsed domain values"
     [ testCase "token is redacted in configuration" $ do
         show token @?= "<Token>"
         assertBool "config leaked token" (not ("hf_test_token" `isInfixOf` show defaultClientConfig {accessToken = Just token}))
     , testCase "invalid tokens never echo their input" $ mapM_ (\value -> do
-        let result = mkToken value
+        let result = parseToken value
         assertBool "accepted malformed token" (isLeft result)
         assertBool "echoed secret" (not ("SECRET" `isInfixOf` show result)))
         ["", "hf_SECRET\r\nInjected: true", "hf_SECRET token", "hf_SECRET\955"]
     , testGroup "invalid repositories"
-        [ testCase (show bad) $ assertBool "accepted invalid repo" (isLeft (mkRepoId bad))
+        [ testCase (show bad) $ assertBool "accepted invalid repo" (isLeft (parseRepoId bad))
         | bad <- ["", "/name", "name/", "a/b/c", "a/../b", "a?x=1", "https://example.com", "-name", "a..b", "a--b", "name.git", T.replicate 97 "x"] ]
     , testProperty "repository identity round-trips" $ forAll (listOf1 (elements ['a' .. 'z'])) $ \name ->
         let input = "owner/" <> T.pack (take 40 name)
-        in fmap repoIdText (mkRepoId input) === Right input
+        in fmap repoIdText (parseRepoId input) === Right input
     , testCase "branches may include slashes" $
-        fmap revisionText (mkRevision "refs/pr/42") @?= Right "refs/pr/42"
+        fmap revisionText (parseRevision "refs/pr/42") @?= Right "refs/pr/42"
     , testCase "revisions reject empty and dot-only segments" $
-        mapM_ (\input -> assertBool "unsafe revision" (isLeft (mkRevision input))) ["../main", "refs/../main", "/main", "main/"]
+        mapM_ (\input -> assertBool "unsafe revision" (isLeft (parseRevision input))) ["../main", "refs/../main", "/main", "main/"]
     , testGroup "unsafe file paths"
-        [ testCase (show bad) $ assertBool "accepted unsafe path" (isLeft (mkRepoPath bad))
+        [ testCase (show bad) $ assertBool "accepted unsafe path" (isLeft (parseRepoPath bad))
         | bad <- ["", "/config.json", "../config.json", "a/../b", "a/./b", "a//b", "a/", "a\\b", "a\NULb"] ]
     , testCase "Unicode file names remain intact" $
-        fmap repoPathText (mkRepoPath "sub/λ weights.json") @?= Right "sub/λ weights.json"
-    , testCase "unsafe endpoints are rejected before requests" $ do
-        manager <- newManager defaultManagerSettings
-        mapM_ (\endpoint -> assertBool "accepted unsafe endpoint" $
-            isLeft (newClientWithManager manager defaultClientConfig {hubEndpoint = endpoint}))
+        fmap repoPathText (parseRepoPath "sub/λ weights.json") @?= Right "sub/λ weights.json"
+    , testCase "unsafe endpoints fail to parse" $
+        mapM_ (\endpoint -> assertBool "accepted unsafe endpoint" (isLeft (parseEndpoint endpoint)))
             ["http://example.com", "https://user:secret@example.com", "https://example.com/api", "https://example.com?token=x", "https://example.com#fragment", "file:///tmp/data"]
-        assertBool "accepted zero timeout" $ isLeft (newClientWithManager manager defaultClientConfig {timeoutMicroseconds = 0})
+    , testCase "endpoint ports cannot overflow or wrap to another destination" $
+        mapM_ (\portText -> assertBool "invalid port parsed" (isLeft (parseEndpoint ("https://example.com:" <> portText))))
+            ["", "0", "-1", "65536", "65979", "18446744073709552059", "not-a-port"]
+
+    ]
+
+domainTests :: TestTree
+domainTests = testGroup "Domain boundaries"
+    [ testCase "repository components compose without reparsing" $ do
+        owner <- expectRight (parseAccountName "owner")
+        name <- expectRight (parseRepoName "model")
+        qualifiedRepo owner name @?= repository
+        repoOwner repository @?= Just owner
+        repoName repository @?= name
+        repoOwner <$> parseRepoId "bert" @?= Right Nothing
+    , testProperty "parsed repositories survive JSON encoding" $
+        forAll (listOf1 (elements ['a' .. 'z'])) $ \name ->
+            let value = valid (parseRepoId ("owner/" <> T.pack (take 40 name)))
+            in eitherDecode (encode value) === Right value
+    , testCase "qualified fields parse during JSON decoding" $ do
+        mapM_ (\value -> assertBool "invalid response identity accepted" $
+            isLeft (eitherDecode (encode value) :: Either String RepoInfo))
+            [ object ["id" .= ("a/b/c" :: Text)]
+            , object ["id" .= repository, "sha" .= ("abc" :: Text)]
+            , object ["id" .= repository, "siblings" .= [object ["rfilename" .= ("../weights" :: Text)]]]
+            , object ["id" .= repository, "pipeline_tag" .= ("" :: Text)]
+            ]
+        assertBool "invalid account accepted" $
+            isLeft (eitherDecode "{\"name\":\"owner/name\"}" :: Either String UserInfo)
+    , testCase "commit SHAs normalize and become revisions without reparsing" $ do
+        sha <- expectRight (parseCommitSha "0123456789ABCDEF0123456789ABCDEF01234567")
+        commitShaText sha @?= "0123456789abcdef0123456789abcdef01234567"
+        revisionText (commitRevision sha) @?= commitShaText sha
+        eitherDecode (encode sha) @?= Right sha
+        mapM_ (\raw -> assertBool "malformed SHA parsed" (isLeft (parseCommitSha raw)))
+            ["", "abc", T.replicate 40 "g", T.replicate 39 "a", T.replicate 41 "a"]
+    , testCase "all router policies and named providers retain their structure" $ do
+        provider <- expectRight (parseProvider "together")
+        let targets = modelFromRepo repository : map (routeModel repository) [Fastest, Cheapest, Preferred, Via provider]
+        mapM_ (\target -> do
+            modelRepository target @?= repository
+            parseInferenceModel (inferenceModelText target) @?= Right target
+            eitherDecode (encode target) @?= Right target) targets
+        map modelRouting targets @?= [Nothing, Just Fastest, Just Cheapest, Just Preferred, Just (Via provider)]
+        assertBool "policy accepted as provider" (isLeft (parseProvider "fastest"))
+        mapM_ (\raw -> assertBool "malformed model parsed" (isLeft (parseInferenceModel raw)))
+            ["", " ", "owner/model:", ":fastest", "owner/model:fastest:cheapest", "owner/model:bad provider", "owner/model:provider/path"]
+    , testCase "parsed paths and revisions retain escaped and Unicode content" $ do
+        let path = valid (parseRepoPath "λ/a %20.json")
+            revision = valid (parseRevision "refs/pr/42")
+        eitherDecode (encode path) @?= Right path
+        eitherDecode (encode revision) @?= Right revision
+    , testCase "open namespaces retain future server values" $ do
+        info <- expectRight (eitherDecode "{\"id\":\"owner/model\",\"tags\":[\"license:future-1.0\"],\"pipeline_tag\":\"future-task\",\"library_name\":\"future-library\",\"sdk\":\"future-sdk\"}" :: Either String RepoInfo)
+        map hubTagText (repoTags info) @?= ["license:future-1.0"]
+        fmap pipelineTagText (repoPipelineTag info) @?= Just "future-task"
+        fmap libraryNameText (repoLibraryName info) @?= Just "future-library"
+        fmap spaceSdkText (repoSdk info) @?= Just "future-sdk"
+        response <- expectRight (eitherDecode "{\"id\":\"provider:completion:1\",\"model\":\"provider/deployment/model-v2\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"future_role\"},\"finish_reason\":\"future_reason\"}]}" :: Either String ChatCompletion)
+        completionIdText (completionId response) @?= "provider:completion:1"
+        modelNameText (completionModel response) @?= "provider/deployment/model-v2"
+        map (chatRoleText . messageRole . choiceMessage) (completionChoices response) @?= ["future_role"]
+        map (fmap finishReasonText . choiceFinishReason) (completionChoices response) @?= [Just "future_reason"]
+    , testCase "message identifiers parse on input and retain their JSON shape" $ do
+        call <- expectRight (parseToolCallId "call-1")
+        name <- expectRight (parseParticipantName "search_tool")
+        let message = ChatMessage toolRole (Just (String "result")) Nothing (Just call) (Just name)
+        toJSON message @?= object ["role" .= ("tool" :: Text), "content" .= ("result" :: Text), "tool_call_id" .= ("call-1" :: Text), "name" .= ("search_tool" :: Text)]
+        eitherDecode (encode message) @?= Right message
+        mapM_ (\raw -> do
+            participant <- expectRight (parseParticipantName raw)
+            eitherDecode (encode participant) @?= Right participant)
+            ["Zoë Reviewer", T.replicate 128 "x"]
+        mapM_ (\payload -> assertBool "invalid message identifier accepted" $
+            isLeft (eitherDecode payload :: Either String ChatMessage))
+            ["{\"role\":\"\"}", "{\"role\":\"tool\",\"tool_call_id\":\"\"}", "{\"role\":\"user\",\"name\":\"\"}"]
+    , testCase "numeric constraints produce usable types at construction" $ do
+        positiveIntValue <$> mkPositiveInt 1 @?= Right 1
+        mapM_ (\n -> assertBool "nonpositive count parsed" (isLeft (mkPositiveInt n))) [minBound, -1, 0]
+        mapM_ (\n -> assertBool "invalid temperature parsed" (isLeft (mkChatTemperature n))) [-0.1, 2.1, 0/0, 1/0, -1/0]
+        mapM_ (\n -> assertBool "invalid top_p parsed" (isLeft (mkTopP n))) [0, -1, 1.1, 0/0, 1/0]
+        mapM_ (\n -> assertBool "invalid generation temperature parsed" (isLeft (mkGenerationTemperature n))) [0, -1, 0/0, 1/0]
+        mapM_ (\n -> chatTemperatureValue <$> mkChatTemperature n @?= Right n) [0, 2]
+        topPValue <$> mkTopP 1 @?= Right 1
+        generationTemperatureValue <$> mkGenerationTemperature 3 @?= Right 3
+        assertBool "numeric JSON bypassed smart constructor" (isLeft (eitherDecode "0" :: Either String PositiveInt))
+        eitherDecode (encode (valid (mkTopP 0.7))) @?= Right (valid (mkTopP 0.7))
+    , testCase "endpoint parser retains a renderable origin and hides bad credentials" $ do
+        mapM_ (\raw -> do
+            endpoint <- expectRight (parseEndpoint raw)
+            parseEndpoint (endpointText endpoint) @?= Right endpoint)
+            ["https://huggingface.co", "https://router.huggingface.co/", "https://example.com:1", "https://example.com:65535", "http://localhost:8080", "http://127.0.0.1:8000", "http://[::1]:8000"]
+        parseEndpoint (endpointText defaultHubEndpoint) @?= Right defaultHubEndpoint
+        parseEndpoint (endpointText defaultInferenceEndpoint) @?= Right defaultInferenceEndpoint
+        assertBool "parser echoed credentials" (not ("SECRET" `isInfixOf` show (parseEndpoint "https://user:SECRET@example.com")))
     ]
 
 hubTests :: TestTree
@@ -122,9 +219,9 @@ hubTests = testGroup "Hub API"
     [ testCase "lists models with encoded query parameters and authentication" $
         withFixture (jsonReply ("[" <> repoJSON <> "]")) $ \client seen -> do
             page <- listModels client defaultListOptions
-                { listSearch = Just "hello & λ", listAuthor = Just "owner", listFilter = ["text-generation", "pytorch"], listLimit = Just 2, listFull = True }
+                { listSearch = Just "hello & λ", listAuthor = Just (valid (parseAccountName "owner")), listFilter = map (valid . parseHubTag) ["text-generation", "pytorch"], listLimit = Just (valid (mkPositiveInt 2)), listFull = True }
                 >>= expectRight
-            map repoId (pageItems page) @?= ["owner/model"]
+            map repoId (pageItems page) @?= [repository]
             requests <- seen
             case requests of
                 [request] -> do
@@ -138,16 +235,12 @@ hubTests = testGroup "Hub API"
         _ <- listDatasets client defaultListOptions >>= expectRight
         _ <- listSpaces client defaultListOptions >>= expectRight
         map observedPath <$> seen >>= (@?= ["/api/datasets", "/api/spaces"])
-    , testCase "rejects invalid page size without HTTP" $ withFixture (jsonReply "[]") $ \client seen -> do
-        result <- listModels client defaultListOptions {listLimit = Just 0}
-        assertBool "invalid page size accepted" (isLeft result)
-        length <$> seen >>= (@?= 0)
     , testCase "metadata routes preserve slash-containing revisions" $ withFixture (jsonReply repoJSON) $ \client seen -> do
-        let revision = Just (valid (mkRevision "refs/pr/42"))
+        let revision = Just (valid (parseRevision "refs/pr/42"))
         model <- modelInfo client repository revision >>= expectRight
-        repoSha model @?= Just "abc"
+        repoSha model @?= Just (valid (parseCommitSha "0123456789abcdef0123456789abcdef01234567"))
         repoDownloads model @?= Just 42
-        repoSiblings model @?= [RepoFile "config.json" (Just 17)]
+        repoSiblings model @?= [RepoFile (valid (parseRepoPath "config.json")) (Just 17)]
         KM.lookup "futureField" (repoRaw model) @?= Just (Bool True)
         _ <- datasetInfo client repository Nothing >>= expectRight
         _ <- spaceInfo client repository Nothing >>= expectRight
@@ -157,9 +250,22 @@ hubTests = testGroup "Hub API"
         repoTags info @?= []
         repoSiblings info @?= []
         repoPrivate info @?= Nothing
+    , testCase "metadata identifiers feed subsequent requests without parsing" $
+        withServer (\request -> pure $ if "/api/" `BS.isPrefixOf` observedPath request
+            then jsonReply repoJSON else (status200, [], "content")) $ \port seen -> do
+                client <- clientAt port Nothing
+                info <- modelInfo client repository Nothing >>= expectRight
+                case (repoSha info, repoSiblings info) of
+                    (Just sha, file : _) -> do
+                        downloadFile client Model (repoId info) (commitRevision sha) (fileName file) >>= (@?= Right "content")
+                        let target = routeModel (repoId info) Fastest
+                        modelRepository target @?= repoId info
+                    _ -> assertFailure "fixture must include a commit and file"
+                map observedPath <$> seen >>= (@?=
+                    ["/api/models/owner/model", "/owner/model/resolve/0123456789abcdef0123456789abcdef01234567/config.json"])
     , testCase "whoami uses authenticated identity endpoint" $ withFixture (jsonReply "{\"name\":\"emilypi\",\"fullname\":\"Emily\"}") $ \client seen -> do
         user <- whoAmI client >>= expectRight
-        userName user @?= "emilypi"
+        userName user @?= valid (parseAccountName "emilypi")
         map observedPath <$> seen >>= (@?= ["/api/whoami-v2"])
     , testCase "public requests omit Authorization" $ withServer (const (pure (jsonReply "[]"))) $ \port seen -> do
         client <- clientAt port Nothing
@@ -175,7 +281,7 @@ hubTests = testGroup "Hub API"
                     Nothing -> assertFailure "missing continuation"
                     Just next -> do
                         second <- nextPage client next >>= expectRight
-                        map repoId (pageItems second) @?= ["owner/model"]
+                        map repoId (pageItems second) @?= [repository]
                         pageNext second @?= Nothing
                 map observedQuery <$> seen >>= (@?= [[], [("cursor", Just "a,b")]])
     , testCase "cross-origin continuations are rejected" $
@@ -185,6 +291,15 @@ hubTests = testGroup "Hub API"
                 Just next -> (nextPage client next :: IO (Either HuggingFaceError (Page RepoInfo))) >>= (@?= Left InvalidPagination)
                 Nothing -> assertFailure "missing continuation"
             length <$> seen >>= (@?= 1)
+    , testCase "Link parameters accept HTTP whitespace around names and values" $
+        withFixture (status200, [("link", "</api/models?cursor=x>;\trel\t=\t\"next\"\t")], "[]") $ \client seen -> do
+            first <- listModels client defaultListOptions >>= expectRight
+            case pageNext first of
+                Nothing -> assertFailure "missing tab-separated continuation"
+                Just next -> do
+                    second <- nextPage client next :: IO (Either HuggingFaceError (Page RepoInfo))
+                    _ <- expectRight second
+                    map observedQuery <$> seen >>= (@?= [[], [("cursor", Just "x")]])
     , testCase "relative pagination uses the final redirected URL" $
         withServer (\request -> pure $ case observedPath request of
             "/api/models" -> (status302, [(hLocation, "/relocated/models")], "")
@@ -197,11 +312,11 @@ hubTests = testGroup "Hub API"
                     Nothing -> assertFailure "missing continuation"
                     Just next -> do
                         result <- nextPage client next >>= expectRight
-                        map repoId (pageItems result) @?= ["owner/model"]
+                        map repoId (pageItems result) @?= [repository]
                 map observedPath <$> seen >>= (@?= ["/api/models", "/relocated/models", "/relocated/models"])
     , testCase "downloads encode file names and repository prefixes" $ withFixture (jsonReply "bytes") $ \client seen -> do
-        let revision = valid (mkRevision "branch/name")
-            file = valid (mkRepoPath "sub/λ weights?.json")
+        let revision = valid (parseRevision "branch/name")
+            file = valid (parseRepoPath "sub/λ weights?.json")
         mapM_ (\kind -> downloadFile client kind repository revision file >>= (@?= Right "bytes")) [Model, Dataset, Space]
         map (lookup hAccept . observedHeaders) <$> seen >>= (@?= replicate 3 (Just "*/*"))
         map observedPath <$> seen >>= (@?=
@@ -247,26 +362,26 @@ transportTests = testGroup "Transport"
         length <$> seen >>= (@?= 6)
     , testCase "download redirects remove credentials across ports" $
         withServer (const (pure (jsonReply "download"))) $ \cdnPort cdnSeen ->
-            withFixture (status302, [(hLocation, B8.pack (origin cdnPort ++ "/blob"))], "") $ \client _ -> do
-                downloadFile client Model repository mainRevision (valid (mkRepoPath "weights.bin")) >>= (@?= Right "download")
+            withFixture (status302, [(hLocation, encodeUtf8 (origin cdnPort <> "/blob"))], "") $ \client _ -> do
+                downloadFile client Model repository mainRevision (valid (parseRepoPath "weights.bin")) >>= (@?= Right "download")
                 map (lookup hAuthorization . observedHeaders) <$> cdnSeen >>= (@?= [Nothing])
     , testCase "download callbacks can stop early and subsequent requests work" $ withFixture (jsonReply "payload") $ \client _ -> do
-        result <- withDownload client Model repository mainRevision (valid (mkRepoPath "file")) brRead
+        result <- withDownload client Model repository mainRevision (valid (parseRepoPath "file")) brRead
         result @?= Right "payload"
-        result2 <- withDownload client Model repository mainRevision (valid (mkRepoPath "file")) (const (pure ()))
+        result2 <- withDownload client Model repository mainRevision (valid (parseRepoPath "file")) (const (pure ()))
         result2 @?= Right ()
     , testCase "callback exceptions and asynchronous cancellation propagate" $ withFixture (jsonReply "payload") $ \client _ -> do
-        ioResult <- try (withDownload client Model repository mainRevision (valid (mkRepoPath "file")) (const (ioError (userError "callback")))) :: IO (Either IOException (Either HuggingFaceError ()))
+        ioResult <- try (withDownload client Model repository mainRevision (valid (parseRepoPath "file")) (const (ioError (userError "callback")))) :: IO (Either IOException (Either HuggingFaceError ()))
         assertBool "swallowed callback exception" (isLeft ioResult)
-        asyncResult <- try (withDownload client Model repository mainRevision (valid (mkRepoPath "file")) (const (throwIO UserInterrupt))) :: IO (Either AsyncException (Either HuggingFaceError ()))
+        asyncResult <- try (withDownload client Model repository mainRevision (valid (parseRepoPath "file")) (const (throwIO UserInterrupt))) :: IO (Either AsyncException (Either HuggingFaceError ()))
         asyncResult @?= Left UserInterrupt
     ]
 
 inferenceTests :: TestTree
 inferenceTests = testGroup "Hosted inference"
     [ testCase "chat request, extensions, and typed response" $ withFixture (jsonReply chatJSON) $ \client seen -> do
-        let request = (defaultChatRequest "owner/model:fastest" [systemMessage "Be concise", userMessage "Hi"])
-                { chatMaxTokens = Just 20, chatTemperature = Just 0.2
+        let request = (defaultChatRequest (routeModel repository Fastest) (systemMessage "Be concise" :| [userMessage "Hi"]))
+                { chatMaxTokens = Just (valid (mkPositiveInt 20)), chatTemperature = Just (valid (mkChatTemperature 0.2))
                 , chatExtra = KM.fromList [("stream", Bool True), ("model", String "wrong"), ("seed", Number 42)] }
         response <- chatCompletion client request >>= expectRight
         completionUsage response @?= Just (Usage 2 3 5)
@@ -290,13 +405,12 @@ inferenceTests = testGroup "Hosted inference"
         messageContent message @?= Nothing
         assertBool "lost tool calls" (messageToolCalls message /= Nothing)
         eitherDecode (encode message) @?= Right message
-    , testCase "invalid chat settings are rejected locally" $ withFixture (jsonReply chatJSON) $ \client seen -> do
-        let base = defaultChatRequest "owner/model" [userMessage "Hi"]
-        mapM_ (\request -> chatCompletion client request >>= assertBool "accepted invalid chat" . isLeft)
-            [base {chatMessages = []}, base {chatModel = " "}, base {chatMaxTokens = Just 0}, base {chatTemperature = Just (0/0)}, base {chatTopP = Just 2}]
-        length <$> seen >>= (@?= 0)
+    , testCase "successful TGI chat responses can have an empty completion ID" $
+        withFixture (jsonReply "{\"id\":\"\",\"model\":\"tgi\",\"choices\":[]}") $ \client _ -> do
+            response <- chatCompletion client (defaultChatRequest (modelFromRepo repository) (userMessage "Hi" :| [])) >>= expectRight
+            completionIdText (completionId response) @?= ""
     , testCase "chat redirects are returned without replaying POST" $ withFixture (status307, [(hLocation, "/other")], "") $ \client seen -> do
-        response <- chatCompletion client (defaultChatRequest "owner/model" [userMessage "Hi"])
+        response <- chatCompletion client (defaultChatRequest (modelFromRepo repository) (userMessage "Hi" :| []))
         case response of Left err@HttpError{} -> errorStatus err @?= 307; _ -> assertFailure (show response)
         length <$> seen >>= (@?= 1)
     , testCase "lost response on a reused connection does not replay a billed POST" $ do
@@ -310,15 +424,15 @@ inferenceTests = testGroup "Hosted inference"
                     -- response headers. A default http-client manager retries it.
                     respond (Wai.responseRaw (\_ _ -> pure ()) (Wai.responseLBS status500 [] ""))
         testWithApplication (pure app) $ \port -> do
-            client <- newClient defaultClientConfig {hubEndpoint = origin port, inferenceEndpoint = origin port} >>= expectRight
+            client <- newClient defaultClientConfig {hubEndpoint = endpointAt port, inferenceEndpoint = endpointAt port}
             _ <- listModels client defaultListOptions >>= expectRight
-            result <- chatCompletion client (defaultChatRequest "owner/model" [userMessage "Hi"])
+            result <- chatCompletion client (defaultChatRequest (modelFromRepo repository) (userMessage "Hi" :| []))
             case result of
                 Left (TransportError _) -> pure ()
                 _ -> assertFailure (show result)
             readIORef calls >>= (@?= 1)
     , testCase "feature extraction uses explicit task route and batch" $ withFixture (jsonReply "[[0.1,0.2],[0.3,0.4]]") $ \client seen -> do
-        featureExtraction client repository ["one", "two"] >>= (@?= Right [[0.1,0.2],[0.3,0.4]])
+        featureExtraction client repository ("one" :| ["two"]) >>= (@?= Right [[0.1,0.2],[0.3,0.4]])
         requests <- seen
         case requests of
             [request] -> do
@@ -327,7 +441,7 @@ inferenceTests = testGroup "Hosted inference"
             _ -> assertFailure (show requests)
     , testGroup "generation response shapes"
         [ testCase (show index) $ withFixture (jsonReply payload) $ \client seen -> do
-            textGeneration client repository "Hello" defaultGenerationParameters {generationMaxNewTokens = Just 4} >>= (@?= Right [GeneratedText "world" Nothing])
+            textGeneration client repository "Hello" defaultGenerationParameters {generationMaxNewTokens = Just (valid (mkPositiveInt 4))} >>= (@?= Right [GeneratedText "world" Nothing])
             requests <- seen
             case requests of
                 [request] -> do

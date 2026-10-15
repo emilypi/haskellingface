@@ -10,6 +10,7 @@
 -- Portability : GHC
 module Main (main) where
 
+import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import HuggingFace
@@ -19,20 +20,22 @@ import System.Exit (die)
 -- | Run a Hub query or an explicitly requested hosted chat completion.
 main :: IO ()
 main = do
-    arguments <- getArgs
+    arguments <- map T.pack <$> getArgs
     tokenText <- lookupEnv "HF_TOKEN"
-    token <- orDie (traverse (mkToken . T.pack) tokenText)
-    client <- newClient defaultClientConfig {accessToken = token} >>= orDie
+    token <- orDie (traverse (parseToken . T.pack) tokenText)
+    client <- newClient defaultClientConfig {accessToken = token}
     case arguments of
         ["models", query] -> do
-            page <- listModels client defaultListOptions {listSearch = Just (T.pack query), listLimit = Just 10} >>= orDie
-            mapM_ (T.putStrLn . repoId) (pageItems page)
+            limit <- orDie (mkPositiveInt 10)
+            page <- listModels client defaultListOptions {listSearch = Just query, listLimit = Just limit} >>= orDie
+            mapM_ (T.putStrLn . repoIdText . repoId) (pageItems page)
         ["model", name] -> do
-            repository <- orDie (mkRepoId (T.pack name))
+            repository <- orDie (parseRepoId name)
             info <- modelInfo client repository Nothing >>= orDie
             print info
         ["chat", model, prompt] -> do
-            completion <- chatCompletion client (defaultChatRequest (T.pack model) [userMessage (T.pack prompt)]) >>= orDie
+            target <- orDie (parseInferenceModel model)
+            completion <- chatCompletion client (defaultChatRequest target (userMessage prompt :| [])) >>= orDie
             mapM_ (print . choiceMessage) (completionChoices completion)
         _ -> die "Usage: huggingface-example (models SEARCH | model OWNER/NAME | chat MODEL PROMPT)"
 

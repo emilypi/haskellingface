@@ -1,5 +1,26 @@
 # Execution status
 
+- p4: verified — user requested distinct domain types, smart constructors,
+  Text rather than String, and parsing into types at input boundaries. Parsed
+  endpoints retain their request representation; routed models retain their
+  repository and routing choice. Returned identifiers use the same types as
+  inputs. Free-form content and extension JSON remain open. No unsafe IsString,
+  Read, or exported record selectors for opaque newtype representations.
+  All 78 offline tests pass on GHC 9.14.1 with `-Werror`, including JSON input
+  boundaries, typed response reuse, endpoint port overflow, and HF/TGI wire
+  compatibility. `scripts/validate.sh` passes; every public module has 100%
+  Haddock coverage. An independently unpacked source archive builds and passes
+  the same 78 tests. All three README snippets compile with `-Wall -Werror`;
+  eleven negative compilation checks reject representation bypasses and
+  invalid API input types. `hlint src examples` reports no hints. Four focused
+  review findings were fixed and covered; see `security.md`.
+
+- User override: all pre-commit hooks removed, local `core.hooksPath` unset,
+  and no active hook exists in `.git/hooks`. `AGENTS.md` forbids installing
+  pre-commit hooks. Manual validation and CI remain available.
+
+The p1–p3 entries below record the initial implementation's verification.
+
 - p1: verified — all 66 offline tests pass on GHC 9.14.1, including the
   dropped-response/no-POST-replay regression. Library, tests, and compiled
   example build with `-Werror`.

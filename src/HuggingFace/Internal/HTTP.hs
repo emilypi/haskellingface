@@ -22,7 +22,6 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Char (toLower)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text (Text)
-import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client hiding (TooManyRedirects)
 import Network.HTTP.Types
@@ -74,7 +73,7 @@ getPage client request = do
         pure (Page items (continuation finalRequest headers))
 
 continuePage :: FromJSON a => Client -> NextPage -> IO (Either HuggingFaceError (Page a))
-continuePage client (NextPage url) = case redirectTarget False (clientHub client) (B8.pack url) of
+continuePage client (NextPage url) = case redirectTarget False (clientHub client) url of
     Right target | sameOrigin target (clientHub client) ->
         let request = requestFor client target [] []
         in getPage client request {path = path target, queryString = queryString target}
@@ -158,33 +157,36 @@ continuation :: Request -> ResponseHeaders -> Maybe NextPage
 continuation request headers = do
     link <- listToMaybe (concatMap (links . snd) (filter ((== "link") . fst) headers))
     let resolved = case parseURIReference (B8.unpack link) of
-            Just uri -> show (uri `relativeTo` getUri request)
-            Nothing -> B8.unpack link
+            Just uri -> B8.pack (show (uri `relativeTo` getUri request))
+            Nothing -> link
     pure (NextPage resolved)
   where
-    links = mapMaybe nextLink . splitLinks . B8.unpack
-    nextLink value = case dropWhile (/= '<') value of
-        '<' : rest -> let (url, suffix) = break (== '>') rest
-                          params = map (T.strip . T.pack) (splitOn ';' (drop 1 suffix))
-                      in if any isNext params then Just (B8.pack url) else Nothing
+    links = mapMaybe nextLink . splitLinks
+    nextLink value = case B8.uncons (B8.dropWhile (/= '<') value) of
+        Just ('<', rest) ->
+            let (url, suffix) = B8.break (== '>') rest
+                params = map stripBytes (B8.split ';' (B8.drop 1 suffix))
+            in if not (B8.null suffix) && any isNext params then Just url else Nothing
         _ -> Nothing
-    isNext parameter = case T.breakOn "=" parameter of
-        (name, value) -> T.toLower (T.strip name) == "rel"
-            && "next" `elem` T.words (T.dropAround (== '"') (T.strip (T.drop 1 value)))
+    isNext parameter = case B8.break (== '=') parameter of
+        (name, value) -> B8.map toLower (stripBytes name) == "rel"
+            && "next" `elem` B8.words (B8.dropWhileEnd (== '"') (B8.dropWhile (== '"') (stripBytes (B8.drop 1 value))))
+    stripBytes = B8.dropWhileEnd whitespace . B8.dropWhile whitespace
+    whitespace c = c == ' ' || c == '\t'
 
--- Link targets and quoted parameter values may themselves contain commas.
-splitLinks :: String -> [String]
-splitLinks = go False False []
+-- Keep raw HTTP header octets as bytes. Commas inside targets or quoted
+-- parameter values do not delimit links; a quoted backslash escapes one byte.
+splitLinks :: ByteString -> [ByteString]
+splitLinks = go False False False 0 0
   where
-    go _ _ acc [] = [reverse acc]
-    go angle quoted acc (c : cs)
-        | c == ',' && not angle && not quoted = reverse acc : go False False [] cs
-        | c == '<' && not quoted = go True quoted (c : acc) cs
-        | c == '>' && not quoted = go False quoted (c : acc) cs
-        | c == '"' && not angle = go angle (not quoted) (c : acc) cs
-        | otherwise = go angle quoted (c : acc) cs
-
-splitOn :: Char -> String -> [String]
-splitOn separator value = case break (== separator) value of
-    (part, []) -> [part]
-    (part, _ : rest) -> part : splitOn separator rest
+    go angle quoted escaped start index bytes = case B8.uncons (B8.drop index bytes) of
+        Nothing -> [B8.drop start bytes]
+        Just (c, _)
+            | escaped -> go angle quoted False start (index + 1) bytes
+            | c == '\\' && quoted -> go angle quoted True start (index + 1) bytes
+            | c == ',' && not angle && not quoted ->
+                B8.take (index - start) (B8.drop start bytes) : go False False False (index + 1) (index + 1) bytes
+            | c == '<' && not quoted -> go True quoted False start (index + 1) bytes
+            | c == '>' && not quoted -> go False quoted False start (index + 1) bytes
+            | c == '"' && not angle -> go angle (not quoted) False start (index + 1) bytes
+            | otherwise -> go angle quoted False start (index + 1) bytes

@@ -32,10 +32,10 @@ import HuggingFace.Types
 -- the requested page size, not a total across pages. The server may cap it.
 data ListOptions = ListOptions
     { listSearch :: Maybe Text -- ^ Search repository names.
-    , listAuthor :: Maybe Text -- ^ Restrict to an account or organization.
-    , listFilter :: [Text] -- ^ Repeated @filter@ query parameters.
-    , listSort :: Maybe Text -- ^ Server sort key, such as @downloads@ or @lastModified@.
-    , listLimit :: Maybe Int -- ^ Positive page size.
+    , listAuthor :: Maybe AccountName -- ^ Restrict to an account or organization.
+    , listFilter :: [HubTag] -- ^ Repeated @filter@ query parameters.
+    , listSort :: Maybe SortKey -- ^ Server sort key, such as @downloads@ or @lastModified@.
+    , listLimit :: Maybe PositiveInt -- ^ Positive page size.
     , listFull :: Bool -- ^ Ask for expanded metadata.
     } deriving (Eq, Show)
 
@@ -56,17 +56,15 @@ listSpaces :: Client -> ListOptions -> IO (Either HuggingFaceError (Page RepoInf
 listSpaces = listRepositories Space
 
 listRepositories :: RepoType -> Client -> ListOptions -> IO (Either HuggingFaceError (Page RepoInfo))
-listRepositories kind client options
-    | maybe False (<= 0) (listLimit options) = pure (Left (InvalidInput "Page size must be positive"))
-    | otherwise = getPage client (requestFor client (clientHub client) ["api", repoPlural kind] (listQuery options))
+listRepositories kind client options = getPage client (requestFor client (clientHub client) ["api", repoPlural kind] (listQuery options))
 
 listQuery :: ListOptions -> Query
 listQuery options = catMaybes
     [ field "search" (listSearch options)
-    , field "author" (listAuthor options)
-    , field "sort" (listSort options)
-    , (\n -> ("limit", Just (B8.pack (show n)))) <$> listLimit options
-    ] ++ [("filter", Just (encodeUtf8 f)) | f <- listFilter options]
+    , field "author" (accountNameText <$> listAuthor options)
+    , field "sort" (sortKeyText <$> listSort options)
+    , (\n -> ("limit", Just (B8.pack (show (positiveIntValue n))))) <$> listLimit options
+    ] ++ [("filter", Just (encodeUtf8 (hubTagText f))) | f <- listFilter options]
       ++ [("full", Just "true") | listFull options]
   where
     field key = fmap (\value -> (key, Just (encodeUtf8 value)))

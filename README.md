@@ -57,18 +57,16 @@ whose Haskell packages satisfy the Cabal bounds; the expression is not pinned.
 import HuggingFace
 
 main :: IO ()
-main = do
-    result <- newClient defaultClientConfig
-    case result of
-        Left err -> print err
-        Right client -> do
-            models <- listModels client defaultListOptions
-                { listSearch = Just "bert"
-                , listLimit = Just 10
-                }
-            case models of
-                Left err -> print err
-                Right page -> mapM_ (print . repoId) (pageItems page)
+main = case mkPositiveInt 10 of
+    Left err -> print err
+    Right limit -> do
+        client <- newClient defaultClientConfig
+        models <- listModels client defaultListOptions
+            { listSearch = Just "bert", listLimit = Just limit }
+        case models of
+            Left err -> print err
+            Right page -> mapM_ (print . repoIdText . repoId) (pageItems page)
+
 ```
 
 `listModels`, `listDatasets`, and `listSpaces` return a single `Page RepoInfo`.
@@ -78,7 +76,8 @@ with `IO (Either HuggingFaceError (Page RepoInfo))`. Pagination remains
 explicit so callers control how many requests they make. `listLimit` is the
 requested page size, and the server may cap it.
 
-`mkRepoId`, `mkRevision`, and `mkRepoPath` validate values without throwing.
+`parseRepoId`, `parseRevision`, and `parseRepoPath` turn external `Text` into
+opaque domain values without throwing.
 For example, `modelInfo client repository (Just revision)` retrieves a
 specific revision, while `Nothing` uses the default branch. Revision slashes
 are encoded as part of a single URL segment. `RepoInfo` retains unknown
@@ -86,12 +85,13 @@ metadata in `repoRaw`, and optional fields remain `Nothing` when omitted.
 
 ## Authentication and chat
 
-The library never reads credentials implicitly. Pass a validated token in
+The library never reads credentials implicitly. Pass a parsed token in
 `accessToken`. The example executable reads `HF_TOKEN` when it is present.
 
 ```haskell
 {-# LANGUAGE OverloadedStrings #-}
 
+import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Text as T
 import HuggingFace
 import System.Environment (getEnv)
@@ -99,17 +99,18 @@ import System.Environment (getEnv)
 main :: IO ()
 main = do
     rawToken <- T.pack <$> getEnv "HF_TOKEN"
-    model <- T.pack <$> getEnv "HF_MODEL"
-    case mkToken rawToken of
+    rawModel <- T.pack <$> getEnv "HF_MODEL"
+    let inputs = (,,) <$> parseToken rawToken
+                     <*> parseInferenceModel rawModel
+                     <*> mkPositiveInt 64
+    case inputs of
         Left err -> print err
-        Right token -> do
-            result <- newClient defaultClientConfig { accessToken = Just token }
-            case result of
-                Left err -> print err
-                Right client -> do
-                    let request = (defaultChatRequest model [userMessage "Hello!"])
-                            { chatMaxTokens = Just 64 }
-                    chatCompletion client request >>= print
+        Right (token, model, limit) -> do
+            client <- newClient defaultClientConfig { accessToken = Just token }
+            let request = (defaultChatRequest model (userMessage "Hello!" :| []))
+                    { chatMaxTokens = Just limit }
+            chatCompletion client request >>= print
+
 ```
 
 Set `HF_MODEL` to a currently served model, optionally with a provider suffix.
@@ -128,6 +129,53 @@ cabal run huggingface-example -- chat "$HF_MODEL" "Explain a Haskell functor bri
 ```
 
 Only the last command invokes hosted inference.
+
+## Parse once, use typed values
+
+Text received from configuration or JSON is parsed into opaque types. Request
+functions consume those types and do not recheck their representations. There
+are no partial `IsString` instances, `Read` instances, or exported record fields
+that let callers overwrite a newtype's representation. Renderers such as
+`repoIdText` are ordinary functions. JSON decoding uses the same parsers as
+configuration input.
+
+| Domain | Types and entry points |
+| --- | --- |
+| Repository identity | `parseRepoId`, or `qualifiedRepo` with an `AccountName` and `RepoName` |
+| Repository content | `parseRepoPath`, `parseRevision`, `mainRevision`, `commitRevision` |
+| Commit identity | `parseCommitSha` parses forty hex digits and normalizes case |
+| Chat target | `parseInferenceModel`, or `modelFromRepo` / `routeModel` with an existing `RepoId` |
+| Routing | `Fastest`, `Cheapest`, `Preferred`, or `Via` a parsed `Provider` |
+| Trusted origins | `parseEndpoint` retains a parsed request; default origins need no parsing |
+| Metadata | Separate `HubTag`, `PipelineTag`, `LibraryName`, `SpaceSdk`, and `SortKey` types |
+| Chat identity | Separate `ChatRole`, `ToolCallId`, `ParticipantName`, `CompletionId`, `ModelName`, and `FinishReason` types |
+| Constrained numbers | `mkPositiveInt`, `mkChatTemperature`, `mkTopP`, `mkGenerationTemperature` |
+
+Returned `repoId`, `repoSha`, `fileName`, and `userName` fields are typed too.
+For example, pass `repoId info` straight to `modelInfo`, `fileName file` to
+`downloadFile`, or `commitRevision sha` as a revision. `routeModel (repoId info)
+Fastest` selects a chat target without rendering and reparsing its ID.
+
+`ChatRequest` conversations and `featureExtraction` batches use `NonEmpty`:
+construct one with `first :| rest`. For a dynamic list, use
+`Data.List.NonEmpty.nonEmpty` at the input boundary and handle its `Nothing`
+case there. Counts, page sizes, and response timeouts use `PositiveInt`;
+sampling settings have their own bounds and reject NaN and infinity.
+
+Free-form prompts, generated text, display names, and classifier labels remain
+`Text`. Extension payloads remain JSON. Open server-defined namespaces retain
+future nonblank values rather than enumerating today's tags, roles, or stop
+reasons. A provider's resolved `ModelName` is distinct from a router
+`InferenceModel`, since provider aliases need not be Hub repository names.
+`CompletionId` preserves empty IDs returned by Hugging Face / TGI.
+`String` conversions are confined to dependencies that require them; HTTP
+headers and file contents remain bytes.
+
+This is an API change from the initial unpublished scaffold: `mkToken`,
+`mkRepoId`, `mkRevision`, and `mkRepoPath` are now `parseToken`, `parseRepoId`,
+`parseRevision`, and `parseRepoPath`. `newClient` returns `IO Client`, and
+`newClientWithManager` returns `Client`; configuration failures are handled
+while constructing the typed configuration.
 
 ## Downloads
 
@@ -173,7 +221,9 @@ manager, set `managerRetryableException = const False` to retain the no-replay
 guarantee. The caller is also responsible for its TLS, proxy, and request hooks.
 Only configure trusted Hub/inference origins, because the configured token
 is sent to both. HTTPS is required except for loopback HTTP development servers.
-The default response timeout is 30 seconds; `timeoutMicroseconds` changes it.
+Parse a custom origin with `parseEndpoint` before putting it in the configuration.
+The default response timeout is 30 seconds; set `timeoutMicroseconds` to a
+`PositiveInt` built with `mkPositiveInt` to change it.
 
 Successful JSON responses and `downloadFile` are buffered without a size cap.
 Use bounded page sizes and `withDownload` for large content. Public requests

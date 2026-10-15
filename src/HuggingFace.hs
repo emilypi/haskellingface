@@ -8,7 +8,7 @@
 -- Portability : GHC
 --
 -- Create a reusable 'Client' with 'newClient' and 'defaultClientConfig'.
--- Validate repository names with 'mkRepoId', then call 'modelInfo',
+-- Parse repository names with 'parseRepoId', then call 'modelInfo',
 -- 'listModels', or 'chatCompletion'. See the README for complete examples.
 module HuggingFace
     ( module HuggingFace.Client

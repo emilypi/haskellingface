@@ -1,6 +1,6 @@
 contracts:
   - id: c-client
-    interface: Client is opaque; newClient returns IO (Either HuggingFaceError Client)
+    interface: Client is opaque; newClient consumes parsed ClientConfig and returns IO Client; newClientWithManager is total
   - id: c-errors
     interface: Operations return IO (Either HuggingFaceError a); asynchronous exceptions propagate
   - id: c-pagination
@@ -8,4 +8,6 @@ contracts:
   - id: c-download
     interface: withDownload scopes a streaming BodyReader to a callback; downloadFile buffers explicitly
   - id: c-inference
-    interface: Non-streaming JSON; typed chat, feature extraction, generation, classification plus generic infer
+    interface: Non-streaming JSON; parsed routed models and positive/bounded settings; NonEmpty chat messages and embedding batches
+  - id: c-domain
+    interface: Opaque domain newtypes with parsers and total composition; JSON decoding invokes the same parsers; renderers are ordinary functions

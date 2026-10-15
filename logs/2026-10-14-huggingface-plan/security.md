@@ -1,5 +1,33 @@
 # Focused client security review — 2026-10-14
 
+## Domain parsing follow-up — 2026-10-15
+
+The read-only follow-up review covered opaque representations, JSON parsing,
+endpoint construction, and the pagination byte parser. All four confirmed
+findings were corrected in the implementation and covered by regressions:
+
+- Parse the original URI port into `Integer` and only construct an endpoint for
+  ports 1–65535. This prevents `http-client`'s `Int` parsing and downstream port
+  narrowing from silently selecting a different origin.
+- Preserve empty completion IDs: Hugging Face / TGI can emit them on success.
+  Evidence: the chat-completion examples in the official
+  [InferenceClient source](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/inference/_client.py).
+- Keep participant names open to Unicode, spaces, and long values. The official
+  [HF task schema](https://github.com/huggingface/huggingface.js/blob/main/packages/tasks/src/tasks/chat-completion/spec/input.json)
+  does not specify OpenAI-style length or character restrictions for this field.
+- Trim HTTP optional whitespace (SP and HTAB) in Link parameters after replacing
+  the String parser with a byte parser.
+
+No constructor bypass was found. The implementation session separately checked
+that external GHC compilation rejects constructor access, record updates to
+renderers, coercions into opaque text/numeric wrappers, unparsed endpoints,
+empty chat/embedding lists, mismatched identifier types, and Read/IsString
+construction. Runtime tests retain the redirect, token-redaction, and POST
+no-replay regressions. This follow-up used no credentials or paid API calls.
+
+The sections below record the initial implementation review and its original
+line references and test counts.
+
 Static review of `Client`, `Types`, `Hub`, `Inference`, `Internal.HTTP`, and
 `Internal.Types`, against this plan's contracts and the local API-security and
 OWASP baseline references. No source changes, Cabal commands, live credentials,
