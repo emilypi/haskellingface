@@ -19,3 +19,7 @@
 - Parsec grammars over Text for domain values and endpoint origins, and over
   ByteString for Link headers, with complete input consumption and redacted
   errors. Quoted Link parameters preserve escaped delimiters.
+- Focused public modules for authentication, repositories, Hub metadata,
+  routing, chat, tasks, numeric parameters, and pagination. Errors have their
+  own module; shared parsing/JSON and HTTP utilities are internal. Existing
+  convenience imports remain supported, with no changes to wire behavior.

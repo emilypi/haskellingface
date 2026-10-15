@@ -1,15 +1,49 @@
 components:
-  - {id: types, module: HuggingFace.Types, purpose: validated identifiers and shared response types}
+  - {id: types, module: HuggingFace.Types, purpose: convenience facade over domain modules and errors}
+  - {id: errors, module: HuggingFace.Error, purpose: errors and redacted diagnostics with no client dependency}
+  - {id: auth, module: HuggingFace.Types.Auth, purpose: opaque parsed bearer tokens}
+  - {id: repository, module: HuggingFace.Types.Repository, purpose: repository identities and content references}
+  - {id: hub-types, module: HuggingFace.Types.Hub, purpose: listing options and Hub metadata}
+  - {id: routing, module: HuggingFace.Types.Routing, purpose: model identities and provider selection}
+  - {id: chat, module: HuggingFace.Types.Chat, purpose: chat identifiers and request/response schemas}
+  - {id: tasks, module: HuggingFace.Types.Tasks, purpose: task parameters and result schemas}
+  - {id: parameters, module: HuggingFace.Types.Parameters, purpose: constrained numeric values}
+  - {id: pagination, module: HuggingFace.Types.Pagination, purpose: pages and opaque continuation handles}
+  - {id: utils, module: HuggingFace.Internal.Utils, purpose: shared Parsec and JSON adapters and text/numeric helpers}
+  - {id: http-utils, module: HuggingFace.Internal.HTTP.Utils, purpose: HTTP path/origin helpers and bounded body reads}
+  - {id: grammars, module: HuggingFace.Internal.Parser, purpose: composable domain grammar fragments}
   - {id: client, module: HuggingFace.Client, purpose: manager ownership and endpoint configuration}
   - {id: transport, module: HuggingFace.Internal.HTTP, purpose: requests, redirects, decoding and errors}
   - {id: hub, module: HuggingFace.Hub, purpose: repository discovery, metadata, identity and downloads}
-  - {id: inference, module: HuggingFace.Inference, purpose: task types and hosted inference}
+  - {id: inference, module: HuggingFace.Inference, purpose: hosted inference operations}
 connections:
+  - [utils, errors]
+  - [grammars, utils]
+  - [repository, grammars]
+  - [routing, repository]
+  - [hub-types, repository]
+  - [hub-types, parameters]
+  - [chat, routing]
+  - [chat, parameters]
+  - [tasks, parameters]
+  - [hub, hub-types]
+  - [inference, chat]
+  - [inference, tasks]
   - [hub, transport]
   - [inference, transport]
-  - [transport, client]
-  - [client, types]
+  - [transport, http-utils]
+  - [transport, utils]
+  - [transport, pagination]
+  - [client, auth]
+  - [client, parameters]
+boundaries:
+  - Implementation modules never import the aggregate Types facade.
+  - Domain modules contain their smart constructors, parsers, and JSON instances.
+  - Internal Auth, Client, and Pagination modules own transport-accessible representations.
+  - Internal Repository shares the composable repoIdParser with Routing without exposing it publicly.
+  - Utils depends only on errors and generic dependencies; HTTP helpers have a separate utils module.
+  - Public newtype constructors remain hidden; convenience re-exports preserve existing imports.
 flows:
-  - [validated input, encoded HTTP request, TLS manager, response status, typed JSON result]
+  - [parsed input, encoded HTTP request, TLS manager, response status, typed JSON result]
   - [file reference, GET with bounded redirects, scoped body reader, caller callback]
   - [list response, opaque Link continuation, same-origin check, next typed page]

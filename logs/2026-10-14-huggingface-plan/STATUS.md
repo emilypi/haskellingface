@@ -1,5 +1,20 @@
 # Execution status
 
+- p6: verified — separate errors, shared utilities, repository identity,
+  Hub metadata, routing, chat, tasks, parameters, authentication, and pagination.
+  Types becomes a compatibility facade. Public constructors remain opaque;
+  implementation modules use focused imports rather than the aggregate facade.
+  The test suite now imports all eight domain modules directly; examples also
+  exercise the convenience facade. `scripts/validate.sh` passes on GHC 9.14.1
+  with all 92 offline tests, `-Werror`, clean Cabal metadata, and 100% public
+  Haddock coverage. HLint reports no hints. All 22 library modules are present
+  in the source archive, which independently builds and passes the same tests.
+  All four README snippets compile with `-Wall -Werror`; twenty negative
+  compilation checks reject raw constructors, representation coercions,
+  invalid input types, private parsers/utilities, and hidden-module imports.
+  The source archive excludes logs and hooks. No active pre-commit hook or
+  configured hooks path exists. See README's module map and architecture.yaml.
+
 - p5: verified — replace handwritten text/header parsing with Parsec
   grammars over Text and ByteString. Retain opaque domain types, redacted
   failures, numeric smart constructors, and manual validation without hooks.

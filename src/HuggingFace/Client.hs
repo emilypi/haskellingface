@@ -22,8 +22,11 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.URI (parseURI)
 import qualified Text.Parsec as P
 import qualified HuggingFace.Internal.Parser as Grammar
-import HuggingFace.Internal.Types (Client (..))
-import HuggingFace.Types
+import HuggingFace.Internal.Client (Client (..))
+import HuggingFace.Error (HuggingFaceError (..))
+import HuggingFace.Internal.Utils (TextParser, parseText, matched)
+import HuggingFace.Types.Auth (Token)
+import HuggingFace.Types.Parameters (PositiveInt, positiveIntValue, defaultTimeout)
 
 -- | Parsed HTTP(S) origin. The request representation is retained so client
 -- construction never reparses URLs. Plain HTTP is restricted to loopback.
@@ -39,7 +42,7 @@ instance Eq Endpoint where
 -- non-root path, query, or fragment. Parse errors never echo the input.
 parseEndpoint :: Text -> Either HuggingFaceError Endpoint
 parseEndpoint input = do
-    (tls, parsedPort) <- Grammar.parseText malformed origin input
+    (tls, parsedPort) <- parseText malformed origin input
     -- Delegate complete RFC URI / IPv6 syntax to network-uri (itself backed by
     -- Parsec), then adapt to http-client's required String API. The origin
     -- grammar has already consumed the entire input and bounded the port.
@@ -49,12 +52,12 @@ parseEndpoint input = do
   where
     malformed = InvalidInput "Endpoint requires an HTTPS origin, or loopback HTTP origin, with a port in 1–65535 and no credentials, path, query, or fragment"
 
-origin :: Grammar.Parser (Bool, Int)
+origin :: TextParser (Bool, Int)
 origin = do
     _ <- P.string "http"
     tls <- P.option False (True <$ P.char 's')
     _ <- P.string "://"
-    hostname <- Grammar.matched $
+    hostname <- matched $
         P.between (P.char '[') (P.char ']') (P.skipMany1 (P.noneOf "]"))
             P.<|> P.skipMany1 (P.satisfy (\c -> c /= ':' && c /= '/' && c /= '?' && c /= '#' && c /= '@' && c /= '[' && c /= ']'))
     parsedPort <- P.option (if tls then 443 else 80) (P.char ':' *> Grammar.portNumber)

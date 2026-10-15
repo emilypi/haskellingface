@@ -3,6 +3,15 @@ campaign:
   plan: logs/2026-10-14-huggingface-plan
   mode: solo
 packages:
+  - id: p6
+    name: Domain module boundaries
+    kind: build
+    depends_on: [p5]
+    isolation: in-place
+    scope: {files: [src/**, test/**, huggingface.cabal, README.md, CHANGELOG.md]}
+    tests_first: [focused public imports, opaque constructors, existing HTTP and parser contracts]
+    verify:
+      - {cmd: scripts/validate.sh, expect: exit 0}
   - id: p5
     name: Parsec grammars
     kind: build

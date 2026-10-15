@@ -49,6 +49,47 @@ packages: . /path/to/huggingface
 A `default.nix` expression is supplied for Nix users. Choose a nixpkgs set
 whose Haskell packages satisfy the Cabal bounds; the expression is not pinned.
 
+## Modules
+
+Import `HuggingFace` for the complete API, or use focused imports:
+
+| Module | Responsibility |
+| --- | --- |
+| `HuggingFace.Client` | Client construction, parsed endpoints, and configuration |
+| `HuggingFace.Error` | Error constructors and redacted diagnostics |
+| `HuggingFace.Hub` | Hub operations and downloads |
+| `HuggingFace.Inference` | Hosted inference operations |
+| `HuggingFace.Types.Auth` | Opaque tokens and their parser |
+| `HuggingFace.Types.Repository` | Repository IDs, owners, names, paths, revisions, and commit SHAs |
+| `HuggingFace.Types.Hub` | Listing options, metadata tags, and Hub response records |
+| `HuggingFace.Types.Routing` | Model targets, provider selection, and resolved model names |
+| `HuggingFace.Types.Chat` | Chat identifiers, messages, requests, responses, and defaults |
+| `HuggingFace.Types.Tasks` | Text-generation parameters and task results |
+| `HuggingFace.Types.Parameters` | Constrained numeric types and smart constructors |
+| `HuggingFace.Types.Pagination` | Pages and opaque continuation handles |
+
+`HuggingFace.Types` re-exports the domain modules and errors for convenience.
+Existing imports from `HuggingFace`, `HuggingFace.Types`, `HuggingFace.Hub`,
+and `HuggingFace.Inference` remain supported. JSON instances live with their
+types. Shared parser and JSON utilities live in `HuggingFace.Internal.Utils`;
+HTTP helpers live in `HuggingFace.Internal.HTTP.Utils`. Internal modules are
+hidden from package consumers.
+
+For example, building a chat request needs no transport imports:
+
+```haskell
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.Text (Text)
+import HuggingFace.Error (HuggingFaceError)
+import HuggingFace.Types.Chat (ChatRequest, defaultChatRequest, userMessage)
+import HuggingFace.Types.Routing (parseInferenceModel)
+
+prepareChat :: Text -> Text -> Either HuggingFaceError ChatRequest
+prepareChat target prompt = do
+    model <- parseInferenceModel target
+    pure (defaultChatRequest model (userMessage prompt :| []))
+```
+
 ## Public Hub reads
 
 ```haskell

@@ -40,13 +40,27 @@ library
   exposed-modules:
     HuggingFace
     HuggingFace.Client
+    HuggingFace.Error
     HuggingFace.Hub
     HuggingFace.Inference
     HuggingFace.Types
+    HuggingFace.Types.Auth
+    HuggingFace.Types.Chat
+    HuggingFace.Types.Hub
+    HuggingFace.Types.Pagination
+    HuggingFace.Types.Parameters
+    HuggingFace.Types.Repository
+    HuggingFace.Types.Routing
+    HuggingFace.Types.Tasks
   other-modules:
+    HuggingFace.Internal.Auth
+    HuggingFace.Internal.Client
     HuggingFace.Internal.HTTP
+    HuggingFace.Internal.HTTP.Utils
+    HuggingFace.Internal.Pagination
     HuggingFace.Internal.Parser
-    HuggingFace.Internal.Types
+    HuggingFace.Internal.Repository
+    HuggingFace.Internal.Utils
   build-depends:
       aeson           >=2.1   && <2.4
     , bytestring      >=0.11  && <0.13

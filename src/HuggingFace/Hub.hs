@@ -19,29 +19,18 @@ import Data.Aeson (FromJSON)
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
 import Data.Maybe (catMaybes)
-import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client (BodyReader, brConsume, requestHeaders, responseBody)
 import Network.HTTP.Types (Query, hAccept)
 import HuggingFace.Internal.HTTP
-import HuggingFace.Internal.Types (Client (..))
-import HuggingFace.Types
-
--- | Options common to the Hub's repository listing endpoints. 'listLimit' is
--- the requested page size, not a total across pages. The server may cap it.
-data ListOptions = ListOptions
-    { listSearch :: Maybe Text -- ^ Search repository names.
-    , listAuthor :: Maybe AccountName -- ^ Restrict to an account or organization.
-    , listFilter :: [HubTag] -- ^ Repeated @filter@ query parameters.
-    , listSort :: Maybe SortKey -- ^ Server sort key, such as @downloads@ or @lastModified@.
-    , listLimit :: Maybe PositiveInt -- ^ Positive page size.
-    , listFull :: Bool -- ^ Ask for expanded metadata.
-    } deriving (Eq, Show)
-
--- | Unfiltered first page, with the server's default size and ordering.
-defaultListOptions :: ListOptions
-defaultListOptions = ListOptions Nothing Nothing [] Nothing Nothing False
+import HuggingFace.Internal.Client (Client (..))
+import HuggingFace.Error (HuggingFaceError)
+import HuggingFace.Internal.HTTP.Utils (repoPlural)
+import HuggingFace.Types.Hub
+import HuggingFace.Types.Parameters (positiveIntValue)
+import HuggingFace.Types.Pagination (Page, NextPage)
+import HuggingFace.Types.Repository
 
 -- | Fetch one page of models.
 listModels :: Client -> ListOptions -> IO (Either HuggingFaceError (Page RepoInfo))
@@ -120,8 +109,3 @@ withDownload client kind repository revision file consume =
     request = baseRequest
         { requestHeaders = (hAccept, "*/*") : filter ((/= hAccept) . fst) (requestHeaders baseRequest)
         }
-
-repoPlural :: RepoType -> Text
-repoPlural Model = "models"
-repoPlural Dataset = "datasets"
-repoPlural Space = "spaces"

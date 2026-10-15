@@ -16,7 +16,21 @@ import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text (Text)
 import qualified Data.Text as T
-import HuggingFace
+import HuggingFace.Client
+import HuggingFace.Error
+import HuggingFace.Hub
+    ( listModels, listDatasets, listSpaces, nextPage
+    , modelInfo, datasetInfo, spaceInfo, whoAmI, downloadFile, withDownload
+    )
+import HuggingFace.Inference (chatCompletion, textGeneration, classifyText, featureExtraction, infer)
+import HuggingFace.Types.Auth
+import HuggingFace.Types.Chat
+import HuggingFace.Types.Hub
+import HuggingFace.Types.Pagination
+import HuggingFace.Types.Parameters
+import HuggingFace.Types.Repository
+import HuggingFace.Types.Routing
+import HuggingFace.Types.Tasks
 import Network.HTTP.Client (brRead, defaultManagerSettings, managerRetryableException, newManager)
 import Network.HTTP.Types
 import qualified Network.Wai as Wai
