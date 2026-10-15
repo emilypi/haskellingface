@@ -1,5 +1,17 @@
 # Execution status
 
+- p5: verified — replace handwritten text/header parsing with Parsec
+  grammars over Text and ByteString. Retain opaque domain types, redacted
+  failures, numeric smart constructors, and manual validation without hooks.
+  Added `parsec >=3.1.16 && <3.2`; locally resolved 3.1.18.0. All 92 offline
+  tests pass with `-Werror` on GHC 9.14.1, including full consumption, name
+  boundaries, policy/provider prefixes, non-BMP paths, origin ports, quoted
+  Link parameters, and empty HTTP list members. `scripts/validate.sh` passes,
+  all public modules retain 100% Haddock coverage, and HLint reports no hints.
+  The new internal parser module is present in the source archive; the
+  independently unpacked package builds and passes all 92 tests. Public types
+  and constructors are unchanged. No hooks were installed.
+
 - p4: verified — user requested distinct domain types, smart constructors,
   Text rather than String, and parsing into types at input boundaries. Parsed
   endpoints retain their request representation; routed models retain their

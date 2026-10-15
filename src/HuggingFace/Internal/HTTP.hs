@@ -19,13 +19,16 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
-import Data.Char (toLower)
-import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Char (isAscii, isAlphaNum, ord, toLower)
+import Data.Either (fromRight)
+import Data.Maybe (catMaybes, listToMaybe)
 import Data.Text (Text)
 import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client hiding (TooManyRedirects)
 import Network.HTTP.Types
 import Network.URI (URI (..), URIAuth (..), parseURIReference, relativeTo)
+import qualified Text.Parsec as P
+import qualified Text.Parsec.ByteString as P
 import HuggingFace.Internal.Types
 import HuggingFace.Types (HuggingFaceError (..), Page (..))
 
@@ -160,33 +163,44 @@ continuation request headers = do
             Just uri -> B8.pack (show (uri `relativeTo` getUri request))
             Nothing -> link
     pure (NextPage resolved)
-  where
-    links = mapMaybe nextLink . splitLinks
-    nextLink value = case B8.uncons (B8.dropWhile (/= '<') value) of
-        Just ('<', rest) ->
-            let (url, suffix) = B8.break (== '>') rest
-                params = map stripBytes (B8.split ';' (B8.drop 1 suffix))
-            in if not (B8.null suffix) && any isNext params then Just url else Nothing
-        _ -> Nothing
-    isNext parameter = case B8.break (== '=') parameter of
-        (name, value) -> B8.map toLower (stripBytes name) == "rel"
-            && "next" `elem` B8.words (B8.dropWhileEnd (== '"') (B8.dropWhile (== '"') (stripBytes (B8.drop 1 value))))
-    stripBytes = B8.dropWhileEnd whitespace . B8.dropWhile whitespace
-    whitespace c = c == ' ' || c == '\t'
 
--- Keep raw HTTP header octets as bytes. Commas inside targets or quoted
--- parameter values do not delimit links; a quoted backslash escapes one byte.
-splitLinks :: ByteString -> [ByteString]
-splitLinks = go False False False 0 0
+-- A Link header is a comma-separated list of targets and parameters. Parsing
+-- quoted strings as a unit prevents embedded commas, semicolons, and escaped
+-- quotes from being mistaken for delimiters or relation parameters.
+links :: ByteString -> [ByteString]
+links = fromRight [] . P.parse (linkHeader <* P.eof) ""
+
+linkHeader :: P.Parser [ByteString]
+linkHeader = do
+    ows
+    -- HTTP list recipients ignore empty members (RFC 9110, section 5.6.1.2).
+    entries <- P.optionMaybe link `P.sepBy1` (P.char ',' *> ows)
+    pure [target | (target, parameters) <- catMaybes entries, maybe False (elem "next" . B8.words) (lookup "rel" parameters)]
   where
-    go angle quoted escaped start index bytes = case B8.uncons (B8.drop index bytes) of
-        Nothing -> [B8.drop start bytes]
-        Just (c, _)
-            | escaped -> go angle quoted False start (index + 1) bytes
-            | c == '\\' && quoted -> go angle quoted True start (index + 1) bytes
-            | c == ',' && not angle && not quoted ->
-                B8.take (index - start) (B8.drop start bytes) : go False False False (index + 1) (index + 1) bytes
-            | c == '<' && not quoted -> go True quoted False start (index + 1) bytes
-            | c == '>' && not quoted -> go False quoted False start (index + 1) bytes
-            | c == '"' && not angle -> go angle (not quoted) False start (index + 1) bytes
-            | otherwise -> go angle quoted False start (index + 1) bytes
+    link = do
+        target <- P.between (P.char '<') (P.char '>') $
+            matchedBytes (P.skipMany (P.satisfy (\c -> c > ' ' && c < '\DEL' && c /= '<' && c /= '>')))
+        ows
+        parameters <- P.many (P.char ';' *> ows *> parameter <* ows)
+        pure (target, parameters)
+    parameter = do
+        name <- token <* ows
+        value <- P.option "" (P.char '=' *> ows *> (quoted P.<|> token))
+        pure (B8.map toLower name, value)
+    token = matchedBytes (P.skipMany1 (P.satisfy tokenChar))
+    tokenChar c = (isAscii c && isAlphaNum c) || B8.elem c "!#$%&'*+-.^_`|~"
+    quoted = P.between (P.char '"') (P.char '"') (BS.concat <$> P.many chunk)
+    chunk = (P.char '\\' *> (B8.singleton <$> P.satisfy quotedPair))
+        P.<|> matchedBytes (P.skipMany1 (P.satisfy quotedText))
+    quotedPair c = c == '\t' || (ord c >= 32 && c /= '\DEL')
+    quotedText c = quotedPair c && c /= '"' && c /= '\\'
+
+ows :: P.Parser ()
+ows = P.skipMany (P.satisfy (\c -> c == ' ' || c == '\t'))
+
+matchedBytes :: P.Parser a -> P.Parser ByteString
+matchedBytes parser = do
+    before <- P.getInput
+    _ <- parser
+    after <- P.getInput
+    pure (BS.take (BS.length before - BS.length after) before)

@@ -3,6 +3,15 @@ campaign:
   plan: logs/2026-10-14-huggingface-plan
   mode: solo
 packages:
+  - id: p5
+    name: Parsec grammars
+    kind: build
+    depends_on: [p4]
+    isolation: in-place
+    scope: {files: [src/**, test/**, huggingface.cabal, README.md, CHANGELOG.md]}
+    tests_first: [complete consumption, ambiguous prefixes, grammar boundaries, quoted Link parameters]
+    verify:
+      - {cmd: scripts/validate.sh, expect: exit 0}
   - id: p4
     name: Parse domain values at boundaries
     kind: build

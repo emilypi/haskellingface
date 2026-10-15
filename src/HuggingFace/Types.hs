@@ -41,30 +41,32 @@ module HuggingFace.Types
     , HuggingFaceError (..)
     ) where
 
+import Control.Monad (replicateM_)
 import Data.Aeson
 import Data.Aeson.Types (Parser)
 import Data.ByteString (ByteString)
-import Data.Char (isAscii, isAlphaNum, isControl, isHexDigit)
+import Data.Char (isAscii, isHexDigit)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
+import qualified Text.Parsec as P
+import qualified HuggingFace.Internal.Parser as Grammar
 import HuggingFace.Internal.Types (Token (..), NextPage)
 
 -- | Parse a bearer token without retaining malformed input in errors.
 -- Its 'Show' instance never reveals the value.
 parseToken :: Text -> Either HuggingFaceError Token
-parseToken t
-    | not (T.null t) && T.all (\c -> asciiAlphaNum c || c == '_' || c == '-') t = Right (Token (encodeUtf8 t))
-    | otherwise = Left (InvalidInput "Token requires ASCII letters, digits, underscores, or hyphens")
+parseToken = parseValue "Token requires ASCII letters, digits, underscores, or hyphens" $
+    Token . encodeUtf8 <$> Grammar.takeWhile1P (\c -> Grammar.asciiAlphaNum c || c == '_' || c == '-')
 
 -- | Repository basename, distinct from its optional owner.
 newtype RepoName = RepoName Text deriving (Eq, Ord, Show)
 
 -- | Parse a Hub repository basename.
 parseRepoName :: Text -> Either HuggingFaceError RepoName
-parseRepoName = fmap RepoName . parseName "RepoName"
+parseRepoName = parseValue "Expected a Hub repository basename" (RepoName <$> Grammar.name)
 
 -- | Render a repository basename.
 repoNameText :: RepoName -> Text
@@ -79,10 +81,13 @@ newtype RepoId = RepoId (Maybe AccountName, RepoName) deriving (Eq, Ord, Show)
 
 -- | Parse either a bare repository name or @owner/name@.
 parseRepoId :: Text -> Either HuggingFaceError RepoId
-parseRepoId t = case T.splitOn "/" t of
-    [name] -> RepoId . (,) Nothing <$> parseRepoName name
-    [owner, name] -> qualifiedRepo <$> parseAccountName owner <*> parseRepoName name
-    _ -> Left (InvalidInput "Expected a repository name or owner/name")
+parseRepoId = parseValue "Expected a repository name or owner/name" repoIdParser
+
+repoIdParser :: Grammar.Parser RepoId
+repoIdParser = do
+    first <- Grammar.name
+    P.option (RepoId (Nothing, RepoName first)) $
+        qualifiedRepo (AccountName first) . RepoName <$> (P.char '/' *> Grammar.name)
 
 -- | Assemble a qualified repository from parsed components without reparsing.
 qualifiedRepo :: AccountName -> RepoName -> RepoId
@@ -108,7 +113,7 @@ newtype Revision = Revision (NonEmpty Text) deriving (Eq, Ord, Show)
 
 -- | Parse a revision. Slashes are encoded together as one URL segment.
 parseRevision :: Text -> Either HuggingFaceError Revision
-parseRevision = fmap Revision . parseComponents "Revision"
+parseRevision = parseValue "Expected nonempty revision segments without traversal, controls, or backslashes" (Revision <$> Grammar.components)
 
 -- | Render a revision.
 revisionText :: Revision -> Text
@@ -130,7 +135,7 @@ newtype RepoPath = RepoPath (NonEmpty Text) deriving (Eq, Ord, Show)
 
 -- | Parse a repository-relative path, preserving Unicode and spaces.
 parseRepoPath :: Text -> Either HuggingFaceError RepoPath
-parseRepoPath = fmap RepoPath . parseComponents "RepoPath"
+parseRepoPath = parseValue "Expected a relative repository file path without traversal, controls, or backslashes" (RepoPath <$> Grammar.components)
 
 -- | Render a repository-relative path.
 repoPathText :: RepoPath -> Text
@@ -145,9 +150,8 @@ newtype CommitSha = CommitSha Text deriving (Eq, Ord, Show)
 -- | Parse exactly forty ASCII hexadecimal digits. Use 'parseRevision' for
 -- abbreviated commit references, branches, or tags.
 parseCommitSha :: Text -> Either HuggingFaceError CommitSha
-parseCommitSha t
-    | T.length t == 40 && T.all (\c -> isAscii c && isHexDigit c) t = Right (CommitSha (T.toLower t))
-    | otherwise = Left (InvalidInput "CommitSha requires forty hexadecimal digits")
+parseCommitSha = parseValue "CommitSha requires forty hexadecimal digits" $
+    CommitSha . T.toLower <$> Grammar.matched (replicateM_ 40 (P.satisfy (\c -> isAscii c && isHexDigit c)))
 
 -- | Render a full commit identifier.
 commitShaText :: CommitSha -> Text
@@ -161,7 +165,7 @@ newtype AccountName = AccountName Text deriving (Eq, Ord, Show)
 
 -- | Parse a AccountName from external text.
 parseAccountName :: Text -> Either HuggingFaceError AccountName
-parseAccountName = fmap AccountName . parseName "AccountName"
+parseAccountName = parseValue "Expected a Hub account or organization name" (AccountName <$> Grammar.name)
 
 -- | Render a AccountName.
 accountNameText :: AccountName -> Text
@@ -288,8 +292,8 @@ newtype CompletionId = CompletionId Text deriving (Eq, Ord, Show)
 
 -- | Parse a CompletionId from external text.
 parseCompletionId :: Text -> Either HuggingFaceError CompletionId
-parseCompletionId "" = Right (CompletionId "")
-parseCompletionId t = CompletionId <$> parseLabel "CompletionId" t
+parseCompletionId = parseValue "Expected a completion identifier without controls" $
+    CompletionId <$> (Grammar.label P.<|> ("" <$ P.eof))
 
 -- | Render a CompletionId.
 completionIdText :: CompletionId -> Text
@@ -331,7 +335,7 @@ newtype Provider = Provider Text deriving (Eq, Ord, Show)
 
 -- | Parse a Provider from external text.
 parseProvider :: Text -> Either HuggingFaceError Provider
-parseProvider = fmap Provider . parseProviderSlug
+parseProvider = parseValue "Expected a provider slug, not a routing policy" providerParser
 
 -- | Render a Provider.
 providerText :: Provider -> Text
@@ -369,15 +373,24 @@ newtype InferenceModel = InferenceModel (RepoId, Maybe Routing) deriving (Eq, Or
 
 -- | Parse @owner/model@ or @owner/model:provider-or-policy@.
 parseInferenceModel :: Text -> Either HuggingFaceError InferenceModel
-parseInferenceModel t = case T.splitOn ":" t of
-    [repository] -> modelFromRepo <$> parseRepoId repository
-    [repository, suffix] -> routeModel <$> parseRepoId repository <*> parseRouting suffix
-    _ -> Left (InvalidInput "Expected a model repository with at most one routing suffix")
-  where
-    parseRouting "fastest" = Right Fastest
-    parseRouting "cheapest" = Right Cheapest
-    parseRouting "preferred" = Right Preferred
-    parseRouting name = Via <$> parseProvider name
+parseInferenceModel = parseValue "Expected a model repository with at most one routing suffix" $
+    InferenceModel <$> ((,) <$> repoIdParser <*> P.optionMaybe (P.char ':' *> routingParser))
+
+routingParser :: Grammar.Parser Routing
+routingParser = do
+    slug <- Grammar.providerSlug
+    pure $ case slug of
+        "fastest" -> Fastest
+        "cheapest" -> Cheapest
+        "preferred" -> Preferred
+        _ -> Via (Provider slug)
+
+providerParser :: Grammar.Parser Provider
+providerParser = do
+    routing <- routingParser
+    case routing of
+        Via provider -> pure provider
+        _ -> P.parserFail "Reserved routing policy"
 
 -- | Choose the router's default policy for an existing repository identifier.
 modelFromRepo :: RepoId -> InferenceModel
@@ -482,41 +495,11 @@ parseTextJSON name parse = withText (T.unpack name) (fromEither . parse)
 fromEither :: Either HuggingFaceError a -> Parser a
 fromEither = either (fail . show) pure
 
-asciiAlphaNum :: Char -> Bool
-asciiAlphaNum c = isAscii c && isAlphaNum c
+parseValue :: Text -> Grammar.Parser a -> Text -> Either HuggingFaceError a
+parseValue message = Grammar.parseText (InvalidInput message)
 
-parseName :: Text -> Text -> Either HuggingFaceError Text
-parseName label t = case (T.uncons t, T.unsnoc t) of
-    (Just (first, _), Just (_, lastChar))
-        | T.length t <= 96
-        , T.all (\c -> asciiAlphaNum c || c == '-' || c == '_' || c == '.') t
-        , first /= '-' && first /= '.' && lastChar /= '-' && lastChar /= '.'
-        , not ("--" `T.isInfixOf` t || ".." `T.isInfixOf` t || ".git" `T.isSuffixOf` t)
-        -> Right t
-    _ -> Left (InvalidInput (label <> " requires a Hub name component of 1–96 characters"))
-
--- Open server-defined namespaces: preserve future values, Unicode, spaces, and
--- punctuation. Only empty/blank values and control characters lack an identity.
 parseLabel :: Text -> Text -> Either HuggingFaceError Text
-parseLabel label t
-    | not (T.null (T.strip t)) && not (T.any isControl t) = Right t
-    | otherwise = Left (InvalidInput (label <> " requires nonblank text without control characters"))
-
-parseProviderSlug :: Text -> Either HuggingFaceError Text
-parseProviderSlug t
-    | not (T.null t) && T.all (\c -> asciiAlphaNum c || c == '-') t
-    , t `notElem` ["fastest", "cheapest", "preferred"] = Right t
-    | otherwise = Left (InvalidInput "Expected a provider slug, not a routing policy")
-
-parseComponents :: Text -> Text -> Either HuggingFaceError (NonEmpty Text)
-parseComponents label t = case T.splitOn "/" t of
-    first : rest -> (:|) <$> component first <*> traverse component rest
-    [] -> Left (InvalidInput (label <> " requires at least one segment"))
-  where
-    component part
-        | not (T.null part) && part /= "." && part /= ".."
-        , not (T.any (\c -> isControl c || c == '\\') part) = Right part
-        | otherwise = Left (InvalidInput (label <> " requires nonempty segments without traversal, controls, or backslashes"))
+parseLabel name = parseValue (name <> " requires nonblank text without control characters") Grammar.label
 
 inRange :: Double -> Double -> Double -> Bool
 inRange low high t = not (isNaN t || isInfinite t) && t >= low && t <= high

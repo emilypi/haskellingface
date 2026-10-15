@@ -16,3 +16,6 @@
 - Nonempty conversations and embedding batches, and smart constructors for
   positive limits/timeouts and bounded sampling settings. Client construction
   consumes parsed configuration and no longer returns an input-error branch.
+- Parsec grammars over Text for domain values and endpoint origins, and over
+  ByteString for Link headers, with complete input consumption and redacted
+  errors. Quoted Link parameters preserve escaped delimiters.

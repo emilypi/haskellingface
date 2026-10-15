@@ -87,7 +87,7 @@ jsonReply = (,,) status200 [(hContentType, "application/json")]
 
 main :: IO ()
 main = defaultMain $ testGroup "huggingface"
-    [ identifierTests, domainTests, hubTests, transportTests, inferenceTests ]
+    [ identifierTests, domainTests, grammarTests, hubTests, transportTests, inferenceTests ]
 
 identifierTests :: TestTree
 identifierTests = testGroup "Parsed domain values"
@@ -214,6 +214,54 @@ domainTests = testGroup "Domain boundaries"
         assertBool "parser echoed credentials" (not ("SECRET" `isInfixOf` show (parseEndpoint "https://user:SECRET@example.com")))
     ]
 
+grammarTests :: TestTree
+grammarTests = testGroup "Parsec grammars"
+    [ testCase "Hub names handle punctuation and the exact length boundary" $ do
+        mapM_ (\raw -> fmap repoNameText (parseRepoName raw) @?= Right raw)
+            ["a", "_", "a_b", "a-b.c", "a-.b", "model.gitx", "model.git-more", T.replicate 96 "x"]
+        mapM_ (\raw -> assertBool "malformed name parsed" (isLeft (parseRepoName raw)))
+            [".a", "a.", "a-", "a..b", "a--b", "model.git", T.replicate 97 "x", "owner/name", "model:fastest"]
+        assertBool "invalid owner suffix parsed" (isLeft (parseRepoId "owner.git/model"))
+        assertBool "oversized owner parsed" (isLeft (parseRepoId (T.replicate 97 "x" <> "/model")))
+    , testCase "routing policy prefixes do not consume provider slugs" $ do
+        mapM_ (\raw -> do
+            target <- expectRight (parseInferenceModel ("owner/model:" <> raw))
+            case modelRouting target of
+                Just (Via provider) -> providerText provider @?= raw
+                other -> assertFailure (show other))
+            ["fastest-provider", "cheapest-provider", "preferred-provider"]
+        mapM_ (\raw -> assertBool "trailing input parsed" (isLeft (parseInferenceModel raw)))
+            ["owner/model:fastest/extra", "owner/model:fastest:extra", "owner/model.git:fastest", "owner/model/extra:fastest", "owner/model:fastest\n"]
+    , testCase "tokens and complete identifiers reject trailing input" $ do
+        assertBool "token prefix accepted" (isLeft (parseToken "hf_secret!"))
+        assertBool "SHA prefix accepted" (isLeft (parseCommitSha (T.replicate 40 "a" <> "extra")))
+        mapM_ (\raw -> assertBool "repository prefix accepted" (isLeft (parseRepoId raw)))
+            ["owner/model?key=value", "owner/model\n", "owner/model trailing"]
+    , testCase "component parsing preserves non-BMP text and excludes traversal" $ do
+        let raw = "🦄/λ weights/文件.json"
+        fmap repoPathText (parseRepoPath raw) @?= Right raw
+        fmap revisionText (parseRevision raw) @?= Right raw
+        mapM_ (\bad -> assertBool "bad segment accepted" (isLeft (parseRepoPath bad)))
+            ["🦄/../file", "🦄/./file", "🦄//file", "🦄/file\r\n"]
+    , testCase "open label grammars preserve spaces without accepting blank input" $ do
+        fmap participantNameText (parseParticipantName "  Zoë Reviewer 🦄  ") @?= Right "  Zoë Reviewer 🦄  "
+        mapM_ (\raw -> assertBool "blank label parsed" (isLeft (parseHubTag raw))) ["", " ", "\x2003", "abc\NUL"]
+        fmap completionIdText (parseCompletionId "") @?= Right ""
+        assertBool "blank nonempty completion ID parsed" (isLeft (parseCompletionId " "))
+    , testCase "origin grammar consumes only a complete origin" $ do
+        fmap endpointText (parseEndpoint "https://example.com:000443/") @?= Right "https://example.com/"
+        mapM_ (\raw -> assertBool "non-origin parsed" (isLeft (parseEndpoint raw)))
+            [ "https://example.com//", "https://example.com/?secret=1", "https://example.com/#fragment"
+            , "https://example.com:443garbage", "https://example.com:443:80"
+            , "https://[::1", "https://[not-an-ip]", "http://localhost.evil.example"
+            , "https://example.com\n", "https://example.com@other.example"
+            ]
+    , testProperty "routed repository components render and reparse" $
+        forAll (listOf1 (elements ['a' .. 'z'])) $ \suffix ->
+            let raw = "owner/model-" <> T.pack (take 40 suffix) <> ":fastest-provider"
+            in fmap inferenceModelText (parseInferenceModel raw) === Right raw
+    ]
+
 hubTests :: TestTree
 hubTests = testGroup "Hub API"
     [ testCase "lists models with encoded query parameters and authentication" $
@@ -300,6 +348,34 @@ hubTests = testGroup "Hub API"
                     second <- nextPage client next :: IO (Either HuggingFaceError (Page RepoInfo))
                     _ <- expectRight second
                     map observedQuery <$> seen >>= (@?= [[], [("cursor", Just "x")]])
+    , testCase "quoted Link extensions keep escaped quotes and delimiters inside values" $
+        withFixture (status200, [("link", "</api/models?cursor=a,b>; title=\"one\\\",two;three\"; rel=\"next last\"")], "[]") $ \client seen -> do
+            first <- listModels client defaultListOptions >>= expectRight
+            case pageNext first of
+                Nothing -> assertFailure "missing quoted continuation"
+                Just next -> do
+                    second <- nextPage client next :: IO (Either HuggingFaceError (Page RepoInfo))
+                    _ <- expectRight second
+                    map observedQuery <$> seen >>= (@?= [[], [("cursor", Just "a,b")]])
+    , testCase "HTTP list grammar ignores empty Link members" $
+        withFixture (status200, [("link", " , , </api/models?cursor=x>; rel=next, , ")], "[]") $ \client seen -> do
+            first <- listModels client defaultListOptions >>= expectRight
+            case pageNext first of
+                Nothing -> assertFailure "missing continuation between empty members"
+                Just next -> do
+                    second <- nextPage client next :: IO (Either HuggingFaceError (Page RepoInfo))
+                    _ <- expectRight second
+                    map observedQuery <$> seen >>= (@?= [[], [("cursor", Just "x")]])
+    , testGroup "Link grammar cannot mistake extensions or malformed input for next"
+        [ testCase (show header) $ withFixture (status200, [("link", header)], "[]") $ \client _ -> do
+            page <- listModels client defaultListOptions >>= expectRight
+            pageNext page @?= Nothing
+        | header <- [ "</api/models?cursor=x>; title=\"ignore; rel=next\"; rel=prev"
+                    , "</api/models?cursor=x>; rel=prev; rel=next"
+                    , "</api/models?cursor=x>; rel=\"next\" garbage"
+                    , "</api/models?cursor=x>; rel=\"next"
+                    , "</api/models?cursor=x; rel=next"
+                    ] ]
     , testCase "relative pagination uses the final redirected URL" $
         withServer (\request -> pure $ case observedPath request of
             "/api/models" -> (status302, [(hLocation, "/relocated/models")], "")

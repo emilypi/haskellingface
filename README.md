@@ -139,6 +139,12 @@ that let callers overwrite a newtype's representation. Renderers such as
 `repoIdText` are ordinary functions. JSON decoding uses the same parsers as
 configuration input.
 
+Domain and endpoint grammars use Parsec directly over strict `Text`; pagination
+headers use Parsec over `ByteString`. Parsers require complete input consumption
+and construct the domain values as they parse. Parser diagnostics are replaced
+with redacted errors, since raw unexpected tokens may contain credentials.
+Numeric smart constructors still consume numbers, and Aeson handles JSON.
+
 | Domain | Types and entry points |
 | --- | --- |
 | Repository identity | `parseRepoId`, or `qualifiedRepo` with an `AccountName` and `RepoName` |

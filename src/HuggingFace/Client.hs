@@ -19,8 +19,9 @@ import Network.HTTP.Client
     ( Manager, Request, defaultRequest, getUri, host, managerRetryableException
     , newManager, parseRequest, port, secure )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Network.URI (URI (..), URIAuth (..), parseURI)
-import Text.Read (readMaybe)
+import Network.URI (parseURI)
+import qualified Text.Parsec as P
+import qualified HuggingFace.Internal.Parser as Grammar
 import HuggingFace.Internal.Types (Client (..))
 import HuggingFace.Types
 
@@ -38,26 +39,29 @@ instance Eq Endpoint where
 -- non-root path, query, or fragment. Parse errors never echo the input.
 parseEndpoint :: Text -> Either HuggingFaceError Endpoint
 parseEndpoint input = do
-    uri <- maybe malformed Right (parseURI (T.unpack input))
-    authority <- maybe malformed Right (uriAuthority uri)
-    parsedPort <- case uriPort authority of
-        "" -> Right (if uriScheme uri == "https:" then 443 else 80)
-        ':' : digits -> case readMaybe digits :: Maybe Integer of
-            Just number | number >= 1 && number <= 65535 -> Right (fromInteger number)
-            _ -> malformed
-        _ -> malformed
-    if not (null (uriUserInfo authority)) || null (uriRegName authority)
-        || not (null (uriQuery uri) && null (uriFragment uri))
-        || uriPath uri `notElem` ["", "/"]
-        then malformed
-        else case uriScheme uri of
-            "https:" -> request parsedPort
-            "http:" | uriRegName authority `elem` ["localhost", "127.0.0.1", "[::1]"] -> request parsedPort
-            _ -> malformed
+    (tls, parsedPort) <- Grammar.parseText malformed origin input
+    -- Delegate complete RFC URI / IPv6 syntax to network-uri (itself backed by
+    -- Parsec), then adapt to http-client's required String API. The origin
+    -- grammar has already consumed the entire input and bounded the port.
+    _ <- maybe (Left malformed) Right (parseURI (T.unpack input))
+    request <- maybe (Left malformed) Right (parseRequest (T.unpack input) :: Maybe Request)
+    pure (Endpoint request {secure = tls, port = parsedPort})
   where
-    request parsedPort = maybe malformed (\r -> Right (Endpoint r {port = parsedPort}))
-        (parseRequest (T.unpack input) :: Maybe Request)
-    malformed = Left (InvalidInput "Endpoint requires an HTTPS origin, or loopback HTTP origin, with a port in 1–65535 and no credentials, path, query, or fragment")
+    malformed = InvalidInput "Endpoint requires an HTTPS origin, or loopback HTTP origin, with a port in 1–65535 and no credentials, path, query, or fragment"
+
+origin :: Grammar.Parser (Bool, Int)
+origin = do
+    _ <- P.string "http"
+    tls <- P.option False (True <$ P.char 's')
+    _ <- P.string "://"
+    hostname <- Grammar.matched $
+        P.between (P.char '[') (P.char ']') (P.skipMany1 (P.noneOf "]"))
+            P.<|> P.skipMany1 (P.satisfy (\c -> c /= ':' && c /= '/' && c /= '?' && c /= '#' && c /= '@' && c /= '[' && c /= ']'))
+    parsedPort <- P.option (if tls then 443 else 80) (P.char ':' *> Grammar.portNumber)
+    P.optional (P.char '/')
+    if tls || hostname `elem` ["localhost", "127.0.0.1", "[::1]"]
+        then pure (tls, parsedPort)
+        else P.parserFail "Plain HTTP requires loopback"
 
 -- | Render the parsed origin. A missing root slash is normalized to @/@.
 endpointText :: Endpoint -> Text
