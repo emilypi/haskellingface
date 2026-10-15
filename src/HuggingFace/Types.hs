@@ -8,8 +8,9 @@
 -- Portability : GHC
 --
 -- Import the @HuggingFace.Types.*@ modules for individual domains. This module
--- re-exports their public types and "HuggingFace.Error" for convenience;
--- representations and shared implementation utilities remain hidden.
+-- re-exports their public types and "HuggingFace.Error" for convenience.
+-- Constructors remain opaque; shared helpers are available separately from
+-- "HuggingFace.Utils".
 module HuggingFace.Types
     ( module HuggingFace.Error
     , module HuggingFace.Types.Auth

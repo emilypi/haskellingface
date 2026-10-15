@@ -24,9 +24,8 @@ import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client (BodyReader, brConsume, requestHeaders, responseBody)
 import Network.HTTP.Types (Query, hAccept)
 import HuggingFace.Internal.HTTP
-import HuggingFace.Internal.Client (Client (..))
+import HuggingFace.Client (Client, clientHub)
 import HuggingFace.Error (HuggingFaceError)
-import HuggingFace.Internal.HTTP.Utils (repoPlural)
 import HuggingFace.Types.Hub
 import HuggingFace.Types.Parameters (positiveIntValue)
 import HuggingFace.Types.Pagination (Page, NextPage)

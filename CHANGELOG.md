@@ -21,5 +21,8 @@
   errors. Quoted Link parameters preserve escaped delimiters.
 - Focused public modules for authentication, repositories, Hub metadata,
   routing, chat, tasks, numeric parameters, and pagination. Errors have their
-  own module; shared parsing/JSON and HTTP utilities are internal. Existing
-  convenience imports remain supported, with no changes to wire behavior.
+  own module; shared parsing/JSON and HTTP utilities live in `HuggingFace.Utils`.
+  Existing convenience imports remain supported, with no changes to wire behavior.
+- Domain modules own their implementations directly. Only the transport retains
+  an `Internal` module, and all library modules are exposed by Cabal. Read-only
+  accessors and composable parsers preserve opaque construction boundaries.

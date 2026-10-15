@@ -10,9 +10,12 @@
 -- Portability : GHC
 module HuggingFace.Client
     ( Client, ClientConfig (..), defaultClientConfig, newClient, newClientWithManager
+    , clientManager, clientHub, clientInference, clientToken, clientTimeout
     , Endpoint, parseEndpoint, endpointText, defaultHubEndpoint, defaultInferenceEndpoint
     ) where
 
+import Control.Monad (when)
+import Data.Char (isDigit, ord)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Network.HTTP.Client
@@ -21,12 +24,34 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.URI (parseURI)
 import qualified Text.Parsec as P
-import qualified HuggingFace.Internal.Parser as Grammar
-import HuggingFace.Internal.Client (Client (..))
 import HuggingFace.Error (HuggingFaceError (..))
-import HuggingFace.Internal.Utils (TextParser, parseText, matched)
+import HuggingFace.Utils (TextParser, parseText, matched)
 import HuggingFace.Types.Auth (Token)
 import HuggingFace.Types.Parameters (PositiveInt, positiveIntValue, defaultTimeout)
+
+-- | Reusable connection pool, parsed endpoints, and credentials. Construct a
+-- client with 'newClient' or 'newClientWithManager'; accessors are read-only.
+data Client = Client Manager Request Request (Maybe Token) Int
+
+-- | Connection manager used by this client.
+clientManager :: Client -> Manager
+clientManager (Client manager _ _ _ _) = manager
+
+-- | Parsed Hub origin, without request credentials or endpoint-specific paths.
+clientHub :: Client -> Request
+clientHub (Client _ hub _ _ _) = hub
+
+-- | Parsed inference origin, without request credentials or task-specific paths.
+clientInference :: Client -> Request
+clientInference (Client _ _ inference _ _) = inference
+
+-- | Optional credential for this client's configured origins.
+clientToken :: Client -> Maybe Token
+clientToken (Client _ _ _ token _) = token
+
+-- | Positive response timeout in microseconds.
+clientTimeout :: Client -> Int
+clientTimeout (Client _ _ _ _ timeout) = timeout
 
 -- | Parsed HTTP(S) origin. The request representation is retained so client
 -- construction never reparses URLs. Plain HTTP is restricted to loopback.
@@ -60,7 +85,7 @@ origin = do
     hostname <- matched $
         P.between (P.char '[') (P.char ']') (P.skipMany1 (P.noneOf "]"))
             P.<|> P.skipMany1 (P.satisfy (\c -> c /= ':' && c /= '/' && c /= '?' && c /= '#' && c /= '@' && c /= '[' && c /= ']'))
-    parsedPort <- P.option (if tls then 443 else 80) (P.char ':' *> Grammar.portNumber)
+    parsedPort <- P.option (if tls then 443 else 80) (P.char ':' *> portNumber)
     P.optional (P.char '/')
     if tls || hostname `elem` ["localhost", "127.0.0.1", "[::1]"]
         then pure (tls, parsedPort)
@@ -109,3 +134,19 @@ newClientWithManager manager config =
     let Endpoint hub = hubEndpoint config
         Endpoint inference = inferenceEndpoint config
     in Client manager hub inference (accessToken config) (positiveIntValue (timeoutMicroseconds config))
+
+-- Accumulate with a bounded Int; fail before a later digit could overflow.
+-- Leading zeroes are allowed, but a zero port is not a usable endpoint.
+portNumber :: TextParser Int
+portNumber = do
+    first <- digit
+    number <- rest first
+    when (number == 0) (P.parserFail "Zero port")
+    pure number
+  where
+    digit = (\c -> ord c - ord '0') <$> P.satisfy isDigit
+    rest n = P.option n $ do
+        d <- digit
+        let next = 10 * n + d
+        when (next > 65535) (P.parserFail "Port out of range")
+        rest next

@@ -51,7 +51,7 @@ whose Haskell packages satisfy the Cabal bounds; the expression is not pinned.
 
 ## Modules
 
-Import `HuggingFace` for the complete API, or use focused imports:
+Import `HuggingFace` for the domain API, or use focused imports:
 
 | Module | Responsibility |
 | --- | --- |
@@ -67,13 +67,24 @@ Import `HuggingFace` for the complete API, or use focused imports:
 | `HuggingFace.Types.Tasks` | Text-generation parameters and task results |
 | `HuggingFace.Types.Parameters` | Constrained numeric types and smart constructors |
 | `HuggingFace.Types.Pagination` | Pages and opaque continuation handles |
+| `HuggingFace.Utils` | Shared parsing, JSON, and HTTP utilities |
+| `HuggingFace.Internal.HTTP` | Transport implementation for building additional operations |
 
 `HuggingFace.Types` re-exports the domain modules and errors for convenience.
 Existing imports from `HuggingFace`, `HuggingFace.Types`, `HuggingFace.Hub`,
-and `HuggingFace.Inference` remain supported. JSON instances live with their
-types. Shared parser and JSON utilities live in `HuggingFace.Internal.Utils`;
-HTTP helpers live in `HuggingFace.Internal.HTTP.Utils`. Internal modules are
-hidden from package consumers.
+and `HuggingFace.Inference` remain supported. Domain implementations, parsers,
+and JSON instances live together. Shared helpers live in `HuggingFace.Utils`.
+Every library module is exposed by Cabal, including `HuggingFace.Internal.HTTP`.
+`Internal` identifies transport implementation details, not package visibility;
+import it and `Utils` explicitly when extending the client.
+
+Module visibility does not expose raw constructors. `Token`, `NextPage`, and
+`Client` offer ordinary read-only accessors rather than record selectors.
+`tokenBytes` explicitly reveals the credential for custom transports;
+`nextPageURL` may contain private query parameters. `Token` and `NextPage` retain
+redacted `Show` instances. `nextPageFromHeaders` parses a continuation, and the
+transport checks its origin when it is consumed. `repoIdParser` supports composing larger Parsec
+grammars; `parseRepoId` remains the entry point for a complete external value.
 
 For example, building a chat request needs no transport imports:
 

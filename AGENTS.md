@@ -3,7 +3,9 @@
 Haskell2010 library for Hugging Face Hub and hosted inference. Match the
 packaging and code conventions in emilypi/base64 and emilypi/base64-lens.
 
-- Public modules live in `src/HuggingFace`; transport internals stay hidden.
+- All library modules are exposed by Cabal, including `Internal` modules.
+  Reserve `Internal` for transport implementation details; keep domain logic
+  with its public types and shared helpers in `HuggingFace.Utils`.
 - Use explicit exports and Haddock module headers with Module, Description,
   Copyright, License, Maintainer, Stability, and Portability fields.
 - Keep dependency bounds, `tested-with`, and the CI matrix aligned.

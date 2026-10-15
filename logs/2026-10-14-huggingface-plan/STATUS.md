@@ -1,5 +1,22 @@
 # Execution status
 
+- p7: verified — replace eight internal modules with one exposed transport
+  implementation. Domain modules own their types and parsers; shared helpers
+  live in public Utils. Expose every library module while preserving opaque
+  constructors and read-only accessors. User overrides the old hidden-module
+  policy; AGENTS.md and package metadata now reflect this.
+  The registered package exposes all 16 source modules with no hidden modules.
+  All 95 offline tests pass on GHC 9.14.1 with `-Werror`, both in the checkout
+  and an independently unpacked source archive. New tests import Utils and
+  Internal.HTTP directly, exercise custom operations, and verify that parsed
+  continuations still require the configured origin. `scripts/validate.sh`
+  passes; all modules have 100% Haddock coverage and HLint reports no hints.
+  All four README snippets compile; 23 negative compilation checks reject
+  constructor/coercion/record-update bypasses even with all modules importable.
+  The focused read-only review found no regressions in constructor opacity,
+  origin enforcement, credential redaction, or transport behavior. No hooks
+  were installed; source archives contain neither hooks nor session logs.
+
 - p6: verified — separate errors, shared utilities, repository identity,
   Hub metadata, routing, chat, tasks, parameters, authentication, and pagination.
   Types becomes a compatibility facade. Public constructors remain opaque;

@@ -52,15 +52,8 @@ library
     HuggingFace.Types.Repository
     HuggingFace.Types.Routing
     HuggingFace.Types.Tasks
-  other-modules:
-    HuggingFace.Internal.Auth
-    HuggingFace.Internal.Client
+    HuggingFace.Utils
     HuggingFace.Internal.HTTP
-    HuggingFace.Internal.HTTP.Utils
-    HuggingFace.Internal.Pagination
-    HuggingFace.Internal.Parser
-    HuggingFace.Internal.Repository
-    HuggingFace.Internal.Utils
   build-depends:
       aeson           >=2.1   && <2.4
     , bytestring      >=0.11  && <0.13

@@ -23,6 +23,7 @@ import HuggingFace.Hub
     , modelInfo, datasetInfo, spaceInfo, whoAmI, downloadFile, withDownload
     )
 import HuggingFace.Inference (chatCompletion, textGeneration, classifyText, featureExtraction, infer)
+import qualified HuggingFace.Internal.HTTP as Transport
 import HuggingFace.Types.Auth
 import HuggingFace.Types.Chat
 import HuggingFace.Types.Hub
@@ -31,6 +32,7 @@ import HuggingFace.Types.Parameters
 import HuggingFace.Types.Repository
 import HuggingFace.Types.Routing
 import HuggingFace.Types.Tasks
+import qualified HuggingFace.Utils as Utils
 import Network.HTTP.Client (brRead, defaultManagerSettings, managerRetryableException, newManager)
 import Network.HTTP.Types
 import qualified Network.Wai as Wai
@@ -101,7 +103,38 @@ jsonReply = (,,) status200 [(hContentType, "application/json")]
 
 main :: IO ()
 main = defaultMain $ testGroup "huggingface"
-    [ identifierTests, domainTests, grammarTests, hubTests, transportTests, inferenceTests ]
+    [ identifierTests, domainTests, grammarTests, moduleTests, hubTests, transportTests, inferenceTests ]
+
+moduleTests :: TestTree
+moduleTests = testGroup "Exposed extension modules"
+    [ testCase "transport supports custom operations with parsed client configuration" $
+        withFixture (jsonReply repoJSON) $ \client seen -> do
+            let request = Transport.requestFor client (clientHub client) ["api", "models", "owner", "model"] []
+            response <- Transport.getJSON client request >>= expectRight
+            repoId response @?= repository
+            requests <- seen
+            map observedPath requests @?= ["/api/models/owner/model"]
+            map (lookup hAuthorization . observedHeaders) requests @?= [Just "Bearer hf_test_token"]
+    , testCase "header-created continuations still require the configured origin" $
+        withFixture (jsonReply "[]") $ \client seen -> do
+            let request = Transport.requestFor client (clientHub client) ["api", "models"] []
+                headers = [("link", "<https://other.example/api/models?cursor=PRIVATE>; rel=next")]
+            case nextPageFromHeaders request headers of
+                Nothing -> assertFailure "missing parsed continuation"
+                Just next -> do
+                    nextPageURL next @?= "https://other.example/api/models?cursor=PRIVATE"
+                    show next @?= "<NextPage>"
+                    (Transport.continuePage client next :: IO (Either HuggingFaceError (Page RepoInfo)))
+                        >>= (@?= Left InvalidPagination)
+            requests <- seen
+            length requests @?= 0
+    , testCase "shared parser runners consume complete values and redact failures" $ do
+        Utils.parseValue "Malformed repository" repoIdParser "owner/model" @?= Right repository
+        Utils.parseValue "Malformed repository" repoIdParser "owner/model?secret=PRIVATE"
+            @?= Left (InvalidInput "Malformed repository")
+        (Utils.decodeJSON "{\"id\":\"PRIVATE/invalid/id\"}" :: Either HuggingFaceError RepoInfo)
+            @?= Left DecodeError
+    ]
 
 identifierTests :: TestTree
 identifierTests = testGroup "Parsed domain values"

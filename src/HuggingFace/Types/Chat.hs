@@ -27,7 +27,7 @@ import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import qualified Text.Parsec as P
 import HuggingFace.Error (HuggingFaceError)
-import HuggingFace.Internal.Utils (parseTextJSON, parseLabel, parseValue, label)
+import HuggingFace.Utils (parseTextJSON, parseLabel, parseValue, label)
 import HuggingFace.Types.Parameters (PositiveInt, ChatTemperature, TopP)
 import HuggingFace.Types.Routing (InferenceModel, ModelName)
 

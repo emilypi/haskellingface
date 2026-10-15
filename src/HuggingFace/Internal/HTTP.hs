@@ -8,6 +8,11 @@
 -- Maintainer  : emilypi@cohomolo.gy
 -- Stability   : experimental
 -- Portability : GHC
+--
+-- Transport implementation shared by the Hub and inference APIs. This module
+-- is exposed for callers building additional operations; 'requestFor' prepares
+-- requests using the client's configuration. Import it explicitly rather than
+-- through the "HuggingFace" convenience facade.
 module HuggingFace.Internal.HTTP
     ( requestFor, getJSON, postJSON, getPage, continuePage, withBody
     ) where
@@ -17,19 +22,19 @@ import Data.Aeson (FromJSON, ToJSON, encode)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
-import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import Network.HTTP.Client hiding (TooManyRedirects)
 import Network.HTTP.Types
 import Network.URI (URI (..), URIAuth (..), parseURIReference, relativeTo)
 import HuggingFace.Error (HuggingFaceError (..))
-import HuggingFace.Internal.Auth (Token (..))
-import HuggingFace.Internal.Client (Client (..))
-import HuggingFace.Internal.HTTP.Utils (encodeSegments, readAtMost, sameOrigin)
-import HuggingFace.Internal.Pagination (NextPage (..), links)
-import HuggingFace.Internal.Utils (decodeJSON)
-import HuggingFace.Types.Pagination (Page (..))
+import HuggingFace.Types.Auth (tokenBytes)
+import HuggingFace.Client (Client, clientManager, clientHub, clientToken, clientTimeout)
+import HuggingFace.Utils (encodeSegments, readAtMost, sameOrigin, decodeJSON)
+import HuggingFace.Types.Pagination (Page (..), NextPage, nextPageFromHeaders, nextPageURL)
 
+-- | Prepare a request for a trusted origin. Encodes path segments, sets the
+-- timeout and bearer token, and disables automatic redirects and status throws.
+-- The supplied origin must be trusted with the client's credential.
 requestFor :: Client -> Request -> [Text] -> Query -> Request
 requestFor client base segments query = base
     { path = encodeSegments segments
@@ -41,12 +46,16 @@ requestFor client base segments query = base
     , requestHeaders = [(hAccept, "application/json"), (hUserAgent, "huggingface-haskell/0.1.0.0")]
         ++ case clientToken client of
             Nothing -> []
-            Just (Token token) -> [(hAuthorization, "Bearer " <> token)]
+            Just token -> [(hAuthorization, "Bearer " <> tokenBytes token)]
     }
 
+-- | Execute a prepared request and decode JSON. GET redirects stay on-origin;
+-- response and decoding failures use the library's redacted error types.
 getJSON :: FromJSON a => Client -> Request -> IO (Either HuggingFaceError a)
 getJSON client request = fmap (>>= \(_, _, body) -> decodeJSON body) (getBytes client request)
 
+-- | Submit JSON with a prepared request and decode its response. POST redirects
+-- are not followed; use a manager with transport retries disabled.
 postJSON :: (ToJSON a, FromJSON b) => Client -> Request -> a -> IO (Either HuggingFaceError b)
 postJSON client request payload = getJSON client request
     { method = methodPost
@@ -59,21 +68,26 @@ getBytes client request = withBody False client request $ \response -> do
     chunks <- brConsume (responseBody response)
     pure (getOriginalRequest response, responseHeaders response, BL.fromChunks chunks)
 
+-- | Decode a JSON array and its Link continuation from a prepared request.
 getPage :: FromJSON a => Client -> Request -> IO (Either HuggingFaceError (Page a))
 getPage client request = do
     result <- getBytes client request
     pure $ do
         (finalRequest, headers, body) <- result
         items <- decodeJSON body
-        pure (Page items (continuation finalRequest headers))
+        pure (Page items (nextPageFromHeaders finalRequest headers))
 
+-- | Fetch a continuation only if it resolves to the configured Hub origin.
 continuePage :: FromJSON a => Client -> NextPage -> IO (Either HuggingFaceError (Page a))
-continuePage client (NextPage url) = case redirectTarget False (clientHub client) url of
+continuePage client next = case redirectTarget False (clientHub client) (nextPageURL next) of
     Right target | sameOrigin target (clientHub client) ->
         let request = requestFor client target [] []
         in getPage client request {path = path target, queryString = queryString target}
     _ -> pure (Left InvalidPagination)
 
+-- | Consume a successful response while its body reader is in scope. Setting
+-- the first argument to 'True' allows external GET redirects and strips
+-- credentials when crossing origins. HTTPS downgrades are always rejected.
 -- The response and its socket are closed before following another redirect.
 -- Only GET redirects are followed; replaying a billable POST is never implicit.
 withBody :: Bool -> Client -> Request -> (Response BodyReader -> IO a) -> IO (Either HuggingFaceError a)
@@ -133,11 +147,3 @@ redirectTarget allowExternal current location = do
             , requestHeaders = if sameOrigin current target then requestHeaders current
                 else filter (\(key, _) -> key /= hAuthorization && key /= hCookie) (requestHeaders current)
             }
-
-continuation :: Request -> ResponseHeaders -> Maybe NextPage
-continuation request headers = do
-    link <- listToMaybe (concatMap (links . snd) (filter ((== "link") . fst) headers))
-    let resolved = case parseURIReference (B8.unpack link) of
-            Just uri -> B8.pack (show (uri `relativeTo` getUri request))
-            Nothing -> link
-    pure (NextPage resolved)

@@ -21,7 +21,7 @@ module HuggingFace.Types.Hub
 import Data.Aeson
 import Data.Text (Text)
 import HuggingFace.Error (HuggingFaceError)
-import HuggingFace.Internal.Utils (parseTextJSON, parseLabel)
+import HuggingFace.Utils (parseTextJSON, parseLabel)
 import HuggingFace.Types.Parameters (PositiveInt)
 import HuggingFace.Types.Repository (AccountName, RepoId, CommitSha, RepoPath)
 

@@ -19,10 +19,8 @@ import Data.Aeson
 import Data.Text (Text)
 import qualified Text.Parsec as P
 import HuggingFace.Error (HuggingFaceError)
-import qualified HuggingFace.Internal.Parser as Grammar
-import HuggingFace.Internal.Repository (repoIdParser)
-import HuggingFace.Internal.Utils (TextParser, parseValue, parseTextJSON, parseLabel)
-import HuggingFace.Types.Repository (RepoId, repoIdText)
+import HuggingFace.Utils (TextParser, parseValue, parseTextJSON, parseLabel, takeWhile1P, asciiAlphaNum)
+import HuggingFace.Types.Repository (RepoId, repoIdText, repoIdParser)
 
 -- | Provider-resolved model name; it need not be a Hub repository ID.
 newtype ModelName = ModelName Text deriving (Eq, Ord, Show)
@@ -66,7 +64,7 @@ parseInferenceModel = parseValue "Expected a model repository with at most one r
 
 routingParser :: TextParser Routing
 routingParser = do
-    slug <- Grammar.providerSlug
+    slug <- takeWhile1P (\c -> asciiAlphaNum c || c == '-')
     pure $ case slug of
         "fastest" -> Fastest
         "cheapest" -> Cheapest

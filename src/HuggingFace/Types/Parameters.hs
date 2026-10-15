@@ -17,7 +17,7 @@ module HuggingFace.Types.Parameters
 
 import Data.Aeson
 import HuggingFace.Error (HuggingFaceError (..))
-import HuggingFace.Internal.Utils (fromEither, inRange)
+import HuggingFace.Utils (fromEither, inRange)
 
 -- | Strictly positive machine integer for counts, limits, and microseconds.
 -- No 'Num' instance is supplied, so arithmetic cannot bypass construction.

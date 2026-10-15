@@ -24,7 +24,7 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.Text (Text)
 import qualified Data.Text as T
 import HuggingFace.Internal.HTTP
-import HuggingFace.Internal.Client (Client (..))
+import HuggingFace.Client (Client, clientInference)
 import HuggingFace.Error (HuggingFaceError (..))
 import HuggingFace.Types.Chat
 import HuggingFace.Types.Repository (RepoId, repoIdText)
