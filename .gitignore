@@ -1,0 +1,12 @@
+/dist-newstyle/
+/dist-newstyle-*/
+/dist/
+/cabal.project.local
+/cabal.project.freeze
+/.ghc.environment.*
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+*.tar.gz
+.DS_Store

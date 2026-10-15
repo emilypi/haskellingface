@@ -1,0 +1,11 @@
+contracts:
+  - id: c-client
+    interface: Client is opaque; newClient returns IO (Either HuggingFaceError Client)
+  - id: c-errors
+    interface: Operations return IO (Either HuggingFaceError a); asynchronous exceptions propagate
+  - id: c-pagination
+    interface: Page a exposes items and an optional opaque NextPage; nextPage only follows the configured Hub origin
+  - id: c-download
+    interface: withDownload scopes a streaming BodyReader to a callback; downloadFile buffers explicitly
+  - id: c-inference
+    interface: Non-streaming JSON; typed chat, feature extraction, generation, classification plus generic infer

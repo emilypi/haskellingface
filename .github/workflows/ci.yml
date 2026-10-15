@@ -1,0 +1,48 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        ghc: ['9.6.7', '9.8.4', '9.10.3', '9.12.4', '9.14.1']
+        include:
+          - os: macos-latest
+            ghc: '9.14.1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: haskell-actions/setup@v2.12.1
+        id: setup
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: latest
+      - run: cabal update
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ runner.os }}-${{ runner.arch }}-ghc-${{ matrix.ghc }}-${{ hashFiles('huggingface.cabal', 'cabal.project') }}
+      - name: Validate source distribution
+        run: |
+          cabal check
+          cabal sdist --output-directory="$RUNNER_TEMP/sdist"
+          mkdir "$RUNNER_TEMP/source"
+          tar -xzf "$RUNNER_TEMP/sdist/huggingface-0.1.0.0.tar.gz" -C "$RUNNER_TEMP/source"
+          cd "$RUNNER_TEMP/source/huggingface-0.1.0.0"
+          cabal check
+          cabal build all --enable-tests --ghc-options=-Werror
+          cabal test all --test-show-details=direct --ghc-options=-Werror
+          cabal haddock all

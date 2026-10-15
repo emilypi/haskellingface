@@ -1,0 +1,192 @@
+# huggingface
+
+Haskell bindings to the [Hugging Face Hub](https://huggingface.co/docs/hub/api)
+and [Inference Providers](https://huggingface.co/docs/inference-providers).
+
+`huggingface` provides a reusable HTTP client, typed request and response
+records, explicit errors, pagination, and streaming downloads. It does not
+require Python or execute downloaded model code.
+
+## Scope
+
+| Area | Operations |
+| --- | --- |
+| Hub discovery | Search and filter models, datasets, and Spaces, one page at a time |
+| Hub metadata | Repository metadata and file listings at a branch, tag, or commit |
+| Identity | Look up the configured token's owner |
+| Files | Buffer small files or stream large files through a callback |
+| Router inference | Non-streaming chat completions, multimodal message content, tool calls |
+| HF Inference | Sentence embeddings, text classification, text generation, generic JSON tasks |
+
+This initial release covers the operations above. It does not implement Hub
+uploads or commits, snapshot caching, local inference, binary inference tasks,
+or SSE streaming. `infer` targets the `hf-inference` provider; chat completion
+uses the router and supports provider suffixes. Each model must be served for
+the requested task. The existence of a Hub repository alone does not imply
+hosted inference availability.
+
+## Build
+
+```console
+cabal build all
+cabal test all --test-show-details=direct
+cabal haddock all
+cabal sdist
+```
+
+The package uses Haskell2010 and targets GHC 9.6–9.14. CI builds and tests the
+unpacked source distribution on Linux across that range and on macOS with
+GHC 9.14. The local initial implementation was validated with GHC 9.14.1;
+the CI matrix is not a claim that every compiler was run locally.
+
+To use this checkout from another project, add `huggingface` to its
+`build-depends` and include this directory in that project's `cabal.project`:
+
+```cabal
+packages: . /path/to/huggingface
+```
+
+A `default.nix` expression is supplied for Nix users. Choose a nixpkgs set
+whose Haskell packages satisfy the Cabal bounds; the expression is not pinned.
+
+## Public Hub reads
+
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
+import HuggingFace
+
+main :: IO ()
+main = do
+    result <- newClient defaultClientConfig
+    case result of
+        Left err -> print err
+        Right client -> do
+            models <- listModels client defaultListOptions
+                { listSearch = Just "bert"
+                , listLimit = Just 10
+                }
+            case models of
+                Left err -> print err
+                Right page -> mapM_ (print . repoId) (pageItems page)
+```
+
+`listModels`, `listDatasets`, and `listSpaces` return a single `Page RepoInfo`.
+`pageNext` contains an opaque continuation when another page is available.
+Call `nextPage client continuation` to fetch it; the result type can be fixed
+with `IO (Either HuggingFaceError (Page RepoInfo))`. Pagination remains
+explicit so callers control how many requests they make. `listLimit` is the
+requested page size, and the server may cap it.
+
+`mkRepoId`, `mkRevision`, and `mkRepoPath` validate values without throwing.
+For example, `modelInfo client repository (Just revision)` retrieves a
+specific revision, while `Nothing` uses the default branch. Revision slashes
+are encoded as part of a single URL segment. `RepoInfo` retains unknown
+metadata in `repoRaw`, and optional fields remain `Nothing` when omitted.
+
+## Authentication and chat
+
+The library never reads credentials implicitly. Pass a validated token in
+`accessToken`. The example executable reads `HF_TOKEN` when it is present.
+
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
+import qualified Data.Text as T
+import HuggingFace
+import System.Environment (getEnv)
+
+main :: IO ()
+main = do
+    rawToken <- T.pack <$> getEnv "HF_TOKEN"
+    model <- T.pack <$> getEnv "HF_MODEL"
+    case mkToken rawToken of
+        Left err -> print err
+        Right token -> do
+            result <- newClient defaultClientConfig { accessToken = Just token }
+            case result of
+                Left err -> print err
+                Right client -> do
+                    let request = (defaultChatRequest model [userMessage "Hello!"])
+                            { chatMaxTokens = Just 64 }
+                    chatCompletion client request >>= print
+```
+
+Set `HF_MODEL` to a currently served model, optionally with a provider suffix.
+The token needs permission to call Inference Providers. Hosted calls can incur
+charges. `chatExtra` accepts provider options such as `tools`, `seed`, and
+`response_format`; it cannot override reserved typed fields or enable streaming.
+`ChatMessage` also accepts JSON content arrays for multimodal requests and
+preserves tool calls in responses.
+
+The compiled example offers these commands:
+
+```console
+cabal run huggingface-example -- models bert
+cabal run huggingface-example -- model google-bert/bert-base-uncased
+cabal run huggingface-example -- chat "$HF_MODEL" "Explain a Haskell functor briefly."
+```
+
+Only the last command invokes hosted inference.
+
+## Downloads
+
+`downloadFile client kind repository revision path` buffers a file in memory.
+Use `withDownload` for model weights. It supplies an `http-client` `BodyReader`
+to a callback and releases the connection when the callback returns or throws:
+
+```haskell
+import qualified Data.ByteString as BS
+import Network.HTTP.Client (BodyReader, brRead)
+import System.IO (Handle)
+
+copyBody :: Handle -> BodyReader -> IO ()
+copyBody handle reader = do
+    chunk <- brRead reader
+    if BS.null chunk
+        then pure ()
+        else BS.hPut handle chunk >> copyBody handle reader
+```
+
+Pass `copyBody handle` as the last argument to `withDownload`. The caller owns
+the output handle, path selection, overwrite policy, and cleanup of partially
+written files. Do not retain the reader after the callback returns. The
+library follows at most five GET redirects and removes authentication when
+crossing origins, including ports. HTTPS cannot redirect to HTTP.
+
+## Errors and configuration
+
+Operations return `Either HuggingFaceError a`. HTTP errors retain status,
+request ID, `Retry-After`, and at most 64 KiB of response content. `Show`
+omits response bodies and headers; treat those fields as sensitive when
+inspecting them yourself. Invalid JSON and schema mismatches return
+`DecodeError`. Transport failures are classified without retaining or printing
+the request. Asynchronous exceptions and non-HTTP callback exceptions propagate.
+
+`newClient` creates a reusable TLS connection pool with transport retries
+disabled. POSTs are never followed across redirects or automatically retried.
+This avoids silently replaying a potentially billable request. Callers can
+implement their own explicit retry policy using the returned status and headers.
+
+`newClientWithManager` accepts a caller-owned manager. When constructing that
+manager, set `managerRetryableException = const False` to retain the no-replay
+guarantee. The caller is also responsible for its TLS, proxy, and request hooks.
+Only configure trusted Hub/inference origins, because the configured token
+is sent to both. HTTPS is required except for loopback HTTP development servers.
+The default response timeout is 30 seconds; `timeoutMicroseconds` changes it.
+
+Successful JSON responses and `downloadFile` are buffered without a size cap.
+Use bounded page sizes and `withDownload` for large content. Public requests
+are subject to Hugging Face rate limits; no automatic background requests occur.
+
+## Package conventions
+
+Packaging follows the local `emilypi/base64` and `emilypi/base64-lens`
+repositories: a Cabal Simple library, BSD-3-Clause license, bounded dependencies,
+explicit public modules, Haddock headers, Tasty tests, changelog, contributor
+guide, source-distribution CI, and a Nix expression. `scripts/validate.sh`
+checks the build, tests, documentation, and source archive. All integration
+tests run against local servers and require no token or paid inference.
+
+The GitHub URLs in package metadata identify the intended upstream repository;
+creating this local checkout does not publish it to GitHub or Hackage.

@@ -1,0 +1,345 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+module Main (main) where
+
+import Control.Exception (AsyncException (UserInterrupt), IOException, throwIO, try)
+import Data.Aeson
+import qualified Data.Aeson.KeyMap as KM
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
+import qualified Data.ByteString.Lazy as BL
+import Data.Either (isLeft)
+import Data.IORef
+import Data.List (isInfixOf, sort)
+import Data.Text (Text)
+import qualified Data.Text as T
+import HuggingFace
+import Network.HTTP.Client (brRead, defaultManagerSettings, managerRetryableException, newManager)
+import Network.HTTP.Types
+import qualified Network.Wai as Wai
+import Network.Wai.Handler.Warp (testWithApplication)
+import Test.Tasty
+import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck
+
+data Observed = Observed
+    { observedMethod :: Method
+    , observedPath :: ByteString
+    , observedQuery :: Query
+    , observedHeaders :: RequestHeaders
+    , observedBody :: BL.ByteString
+    } deriving (Show)
+
+type Reply = (Status, ResponseHeaders, BL.ByteString)
+
+withServer :: (Observed -> IO Reply) -> (Int -> IO [Observed] -> IO a) -> IO a
+withServer handler action = do
+    seen <- newIORef []
+    let app request respond = do
+            body <- Wai.strictRequestBody request
+            let observed = Observed (Wai.requestMethod request) (Wai.rawPathInfo request)
+                    (Wai.queryString request) (Wai.requestHeaders request) body
+            atomicModifyIORef' seen (\values -> (observed : values, ()))
+            (status, headers, payload) <- handler observed
+            respond (Wai.responseLBS status headers payload)
+    testWithApplication (pure app) $ \port -> action port (reverse <$> readIORef seen)
+
+withFixture :: Reply -> (Client -> IO [Observed] -> IO a) -> IO a
+withFixture reply action = withServer (const (pure reply)) $ \port seen -> do
+    client <- clientAt port (Just token)
+    action client seen
+
+clientAt :: Int -> Maybe Token -> IO Client
+clientAt port tokenValue = do
+    manager <- newManager defaultManagerSettings {managerRetryableException = const False}
+    expectRight $ newClientWithManager manager defaultClientConfig
+        { hubEndpoint = origin port, inferenceEndpoint = origin port, accessToken = tokenValue }
+
+origin :: Int -> String
+origin port = "http://127.0.0.1:" ++ show port
+
+expectRight :: Show e => Either e a -> IO a
+expectRight = either (\err -> assertFailure (show err) >> fail "unreachable") pure
+
+valid :: Show e => Either e a -> a
+valid = either (error . show) id
+
+token :: Token
+token = valid (mkToken "hf_test_token")
+
+repository :: RepoId
+repository = valid (mkRepoId "owner/model")
+
+repoJSON :: BL.ByteString
+repoJSON = "{\"id\":\"owner/model\",\"sha\":\"abc\",\"private\":false,\"downloads\":42,\"likes\":2,\"siblings\":[{\"rfilename\":\"config.json\",\"size\":17}],\"futureField\":true}"
+
+chatJSON :: BL.ByteString
+chatJSON = "{\"id\":\"chat-1\",\"model\":\"owner/model\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}"
+
+jsonReply :: BL.ByteString -> Reply
+jsonReply = (,,) status200 [(hContentType, "application/json")]
+
+main :: IO ()
+main = defaultMain $ testGroup "huggingface"
+    [ identifierTests, hubTests, transportTests, inferenceTests ]
+
+identifierTests :: TestTree
+identifierTests = testGroup "Validated inputs"
+    [ testCase "token is redacted in configuration" $ do
+        show token @?= "<Token>"
+        assertBool "config leaked token" (not ("hf_test_token" `isInfixOf` show defaultClientConfig {accessToken = Just token}))
+    , testCase "invalid tokens never echo their input" $ mapM_ (\value -> do
+        let result = mkToken value
+        assertBool "accepted malformed token" (isLeft result)
+        assertBool "echoed secret" (not ("SECRET" `isInfixOf` show result)))
+        ["", "hf_SECRET\r\nInjected: true", "hf_SECRET token", "hf_SECRET\955"]
+    , testGroup "invalid repositories"
+        [ testCase (show bad) $ assertBool "accepted invalid repo" (isLeft (mkRepoId bad))
+        | bad <- ["", "/name", "name/", "a/b/c", "a/../b", "a?x=1", "https://example.com", "-name", "a..b", "a--b", "name.git", T.replicate 97 "x"] ]
+    , testProperty "repository identity round-trips" $ forAll (listOf1 (elements ['a' .. 'z'])) $ \name ->
+        let input = "owner/" <> T.pack (take 40 name)
+        in fmap repoIdText (mkRepoId input) === Right input
+    , testCase "branches may include slashes" $
+        fmap revisionText (mkRevision "refs/pr/42") @?= Right "refs/pr/42"
+    , testCase "revisions reject empty and dot-only segments" $
+        mapM_ (\input -> assertBool "unsafe revision" (isLeft (mkRevision input))) ["../main", "refs/../main", "/main", "main/"]
+    , testGroup "unsafe file paths"
+        [ testCase (show bad) $ assertBool "accepted unsafe path" (isLeft (mkRepoPath bad))
+        | bad <- ["", "/config.json", "../config.json", "a/../b", "a/./b", "a//b", "a/", "a\\b", "a\NULb"] ]
+    , testCase "Unicode file names remain intact" $
+        fmap repoPathText (mkRepoPath "sub/λ weights.json") @?= Right "sub/λ weights.json"
+    , testCase "unsafe endpoints are rejected before requests" $ do
+        manager <- newManager defaultManagerSettings
+        mapM_ (\endpoint -> assertBool "accepted unsafe endpoint" $
+            isLeft (newClientWithManager manager defaultClientConfig {hubEndpoint = endpoint}))
+            ["http://example.com", "https://user:secret@example.com", "https://example.com/api", "https://example.com?token=x", "https://example.com#fragment", "file:///tmp/data"]
+        assertBool "accepted zero timeout" $ isLeft (newClientWithManager manager defaultClientConfig {timeoutMicroseconds = 0})
+    ]
+
+hubTests :: TestTree
+hubTests = testGroup "Hub API"
+    [ testCase "lists models with encoded query parameters and authentication" $
+        withFixture (jsonReply ("[" <> repoJSON <> "]")) $ \client seen -> do
+            page <- listModels client defaultListOptions
+                { listSearch = Just "hello & λ", listAuthor = Just "owner", listFilter = ["text-generation", "pytorch"], listLimit = Just 2, listFull = True }
+                >>= expectRight
+            map repoId (pageItems page) @?= ["owner/model"]
+            requests <- seen
+            case requests of
+                [request] -> do
+                    observedPath request @?= "/api/models"
+                    observedMethod request @?= methodGet
+                    lookup hAuthorization (observedHeaders request) @?= Just "Bearer hf_test_token"
+                    sort (observedQuery request) @?= sort
+                        [("search", Just "hello & \206\187"), ("author", Just "owner"), ("filter", Just "text-generation"), ("filter", Just "pytorch"), ("limit", Just "2"), ("full", Just "true")]
+                _ -> assertFailure (show requests)
+    , testCase "lists datasets and Spaces" $ withFixture (jsonReply "[]") $ \client seen -> do
+        _ <- listDatasets client defaultListOptions >>= expectRight
+        _ <- listSpaces client defaultListOptions >>= expectRight
+        map observedPath <$> seen >>= (@?= ["/api/datasets", "/api/spaces"])
+    , testCase "rejects invalid page size without HTTP" $ withFixture (jsonReply "[]") $ \client seen -> do
+        result <- listModels client defaultListOptions {listLimit = Just 0}
+        assertBool "invalid page size accepted" (isLeft result)
+        length <$> seen >>= (@?= 0)
+    , testCase "metadata routes preserve slash-containing revisions" $ withFixture (jsonReply repoJSON) $ \client seen -> do
+        let revision = Just (valid (mkRevision "refs/pr/42"))
+        model <- modelInfo client repository revision >>= expectRight
+        repoSha model @?= Just "abc"
+        repoDownloads model @?= Just 42
+        repoSiblings model @?= [RepoFile "config.json" (Just 17)]
+        KM.lookup "futureField" (repoRaw model) @?= Just (Bool True)
+        _ <- datasetInfo client repository Nothing >>= expectRight
+        _ <- spaceInfo client repository Nothing >>= expectRight
+        map observedPath <$> seen >>= (@?= ["/api/models/owner/model/revision/refs%2Fpr%2F42", "/api/datasets/owner/model", "/api/spaces/owner/model"])
+    , testCase "metadata tolerates absent and null optional fields" $ do
+        info <- expectRight (eitherDecode "{\"id\":\"owner/model\",\"tags\":null,\"siblings\":null}" :: Either String RepoInfo)
+        repoTags info @?= []
+        repoSiblings info @?= []
+        repoPrivate info @?= Nothing
+    , testCase "whoami uses authenticated identity endpoint" $ withFixture (jsonReply "{\"name\":\"emilypi\",\"fullname\":\"Emily\"}") $ \client seen -> do
+        user <- whoAmI client >>= expectRight
+        userName user @?= "emilypi"
+        map observedPath <$> seen >>= (@?= ["/api/whoami-v2"])
+    , testCase "public requests omit Authorization" $ withServer (const (pure (jsonReply "[]"))) $ \port seen -> do
+        client <- clientAt port Nothing
+        _ <- listModels client defaultListOptions >>= expectRight
+        map (lookup hAuthorization . observedHeaders) <$> seen >>= (@?= [Nothing])
+    , testCase "Link pagination handles commas, quoted parameters and relative URLs" $
+        withServer (\request -> pure $ if null (observedQuery request)
+            then (status200, [("link", "</api/models?cursor=a,b>; title=\"one,two\"; rel=\"next last\", </api/models?cursor=old>; rel=\"prev\"")], "[]")
+            else jsonReply ("[" <> repoJSON <> "]")) $ \port seen -> do
+                client <- clientAt port (Just token)
+                first <- listModels client defaultListOptions >>= expectRight
+                case pageNext first of
+                    Nothing -> assertFailure "missing continuation"
+                    Just next -> do
+                        second <- nextPage client next >>= expectRight
+                        map repoId (pageItems second) @?= ["owner/model"]
+                        pageNext second @?= Nothing
+                map observedQuery <$> seen >>= (@?= [[], [("cursor", Just "a,b")]])
+    , testCase "cross-origin continuations are rejected" $
+        withFixture (status200, [("link", "<https://example.invalid/api/models?cursor=x>; rel=next")], "[]") $ \client seen -> do
+            first <- listModels client defaultListOptions >>= expectRight
+            case pageNext first of
+                Just next -> (nextPage client next :: IO (Either HuggingFaceError (Page RepoInfo))) >>= (@?= Left InvalidPagination)
+                Nothing -> assertFailure "missing continuation"
+            length <$> seen >>= (@?= 1)
+    , testCase "relative pagination uses the final redirected URL" $
+        withServer (\request -> pure $ case observedPath request of
+            "/api/models" -> (status302, [(hLocation, "/relocated/models")], "")
+            "/relocated/models" | null (observedQuery request) -> (status200, [("link", "<?cursor=next>; rel=next")], "[]")
+            "/relocated/models" -> jsonReply ("[" <> repoJSON <> "]")
+            _ -> (status404, [], "")) $ \port seen -> do
+                client <- clientAt port Nothing
+                page <- listModels client defaultListOptions >>= expectRight
+                case pageNext page of
+                    Nothing -> assertFailure "missing continuation"
+                    Just next -> do
+                        result <- nextPage client next >>= expectRight
+                        map repoId (pageItems result) @?= ["owner/model"]
+                map observedPath <$> seen >>= (@?= ["/api/models", "/relocated/models", "/relocated/models"])
+    , testCase "downloads encode file names and repository prefixes" $ withFixture (jsonReply "bytes") $ \client seen -> do
+        let revision = valid (mkRevision "branch/name")
+            file = valid (mkRepoPath "sub/λ weights?.json")
+        mapM_ (\kind -> downloadFile client kind repository revision file >>= (@?= Right "bytes")) [Model, Dataset, Space]
+        map (lookup hAccept . observedHeaders) <$> seen >>= (@?= replicate 3 (Just "*/*"))
+        map observedPath <$> seen >>= (@?=
+            [ "/owner/model/resolve/branch%2Fname/sub/%CE%BB%20weights%3F.json"
+            , "/datasets/owner/model/resolve/branch%2Fname/sub/%CE%BB%20weights%3F.json"
+            , "/spaces/owner/model/resolve/branch%2Fname/sub/%CE%BB%20weights%3F.json" ])
+    ]
+
+transportTests :: TestTree
+transportTests = testGroup "Transport"
+    [ testGroup "HTTP errors"
+        [ testCase (show code) $ withFixture (mkStatus code "error", [("x-request-id", "request-42"), ("retry-after", "7")], "{\"error\":\"hf_test_token\"}") $ \client seen -> do
+            result <- modelInfo client repository Nothing
+            case result of
+                Left err@HttpError{} -> do
+                    errorStatus err @?= code
+                    errorRequestId err @?= Just "request-42"
+                    errorRetryAfter err @?= Just "7"
+                    assertBool "error body lost" ("hf_test_token" `BS.isInfixOf` errorBody err)
+                    assertBool "error display leaked token" (not ("hf_test_token" `isInfixOf` show err))
+                _ -> assertFailure (show result)
+            length <$> seen >>= (@?= 1)
+        | code <- [401, 403, 404, 429, 500, 503] ]
+    , testCase "error bodies are bounded" $ withFixture (status500, [], BL.replicate 100000 120) $ \client _ -> do
+        result <- modelInfo client repository Nothing
+        case result of
+            Left err@HttpError{} -> BS.length (errorBody err) @?= 65536
+            _ -> assertFailure (show result)
+    , testGroup "JSON errors"
+        [ testCase (B8.unpack (BL.toStrict payload)) $ withFixture (jsonReply payload) $ \client _ ->
+            modelInfo client repository Nothing >>= (@?= Left DecodeError)
+        | payload <- ["<html>error</html>", "{\"not_id\":true}", "{\"id\":3}"] ]
+    , testCase "same-origin GET redirects retain token" $
+        withServer (\request -> pure $ if observedPath request == "/api/models/owner/model"
+            then (status302, [(hLocation, "/canonical")], "") else jsonReply repoJSON) $ \port seen -> do
+                client <- clientAt port (Just token)
+                _ <- modelInfo client repository Nothing >>= expectRight
+                map (lookup hAuthorization . observedHeaders) <$> seen >>= (@?= replicate 2 (Just "Bearer hf_test_token"))
+    , testCase "API redirects cannot cross origins" $ withFixture (status302, [(hLocation, "https://example.invalid/data")], "") $ \client _ ->
+        modelInfo client repository Nothing >>= (@?= Left UnsafeRedirect)
+    , testCase "redirect loops terminate" $ withFixture (status302, [(hLocation, "/loop")], "") $ \client seen -> do
+        modelInfo client repository Nothing >>= (@?= Left TooManyRedirects)
+        length <$> seen >>= (@?= 6)
+    , testCase "download redirects remove credentials across ports" $
+        withServer (const (pure (jsonReply "download"))) $ \cdnPort cdnSeen ->
+            withFixture (status302, [(hLocation, B8.pack (origin cdnPort ++ "/blob"))], "") $ \client _ -> do
+                downloadFile client Model repository mainRevision (valid (mkRepoPath "weights.bin")) >>= (@?= Right "download")
+                map (lookup hAuthorization . observedHeaders) <$> cdnSeen >>= (@?= [Nothing])
+    , testCase "download callbacks can stop early and subsequent requests work" $ withFixture (jsonReply "payload") $ \client _ -> do
+        result <- withDownload client Model repository mainRevision (valid (mkRepoPath "file")) brRead
+        result @?= Right "payload"
+        result2 <- withDownload client Model repository mainRevision (valid (mkRepoPath "file")) (const (pure ()))
+        result2 @?= Right ()
+    , testCase "callback exceptions and asynchronous cancellation propagate" $ withFixture (jsonReply "payload") $ \client _ -> do
+        ioResult <- try (withDownload client Model repository mainRevision (valid (mkRepoPath "file")) (const (ioError (userError "callback")))) :: IO (Either IOException (Either HuggingFaceError ()))
+        assertBool "swallowed callback exception" (isLeft ioResult)
+        asyncResult <- try (withDownload client Model repository mainRevision (valid (mkRepoPath "file")) (const (throwIO UserInterrupt))) :: IO (Either AsyncException (Either HuggingFaceError ()))
+        asyncResult @?= Left UserInterrupt
+    ]
+
+inferenceTests :: TestTree
+inferenceTests = testGroup "Hosted inference"
+    [ testCase "chat request, extensions, and typed response" $ withFixture (jsonReply chatJSON) $ \client seen -> do
+        let request = (defaultChatRequest "owner/model:fastest" [systemMessage "Be concise", userMessage "Hi"])
+                { chatMaxTokens = Just 20, chatTemperature = Just 0.2
+                , chatExtra = KM.fromList [("stream", Bool True), ("model", String "wrong"), ("seed", Number 42)] }
+        response <- chatCompletion client request >>= expectRight
+        completionUsage response @?= Just (Usage 2 3 5)
+        map (messageContent . choiceMessage) (completionChoices response) @?= [Just (String "Hello!")]
+        requests <- seen
+        case requests of
+            [sent] -> do
+                observedPath sent @?= "/v1/chat/completions"
+                observedMethod sent @?= methodPost
+                lookup hContentType (observedHeaders sent) @?= Just "application/json"
+                payload <- expectRight (eitherDecode (observedBody sent) :: Either String Object)
+                KM.lookup "model" payload @?= Just (String "owner/model:fastest")
+                KM.lookup "stream" payload @?= Just (Bool False)
+                KM.lookup "seed" payload @?= Just (Number 42)
+                KM.lookup "max_tokens" payload @?= Just (Number 20)
+                KM.member "top_p" payload @?= False
+            _ -> assertFailure (show requests)
+    , testCase "tool-call messages allow absent content" $ do
+        let payload = "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call-1\"}]}"
+        message <- expectRight (eitherDecode payload :: Either String ChatMessage)
+        messageContent message @?= Nothing
+        assertBool "lost tool calls" (messageToolCalls message /= Nothing)
+        eitherDecode (encode message) @?= Right message
+    , testCase "invalid chat settings are rejected locally" $ withFixture (jsonReply chatJSON) $ \client seen -> do
+        let base = defaultChatRequest "owner/model" [userMessage "Hi"]
+        mapM_ (\request -> chatCompletion client request >>= assertBool "accepted invalid chat" . isLeft)
+            [base {chatMessages = []}, base {chatModel = " "}, base {chatMaxTokens = Just 0}, base {chatTemperature = Just (0/0)}, base {chatTopP = Just 2}]
+        length <$> seen >>= (@?= 0)
+    , testCase "chat redirects are returned without replaying POST" $ withFixture (status307, [(hLocation, "/other")], "") $ \client seen -> do
+        response <- chatCompletion client (defaultChatRequest "owner/model" [userMessage "Hi"])
+        case response of Left err@HttpError{} -> errorStatus err @?= 307; _ -> assertFailure (show response)
+        length <$> seen >>= (@?= 1)
+    , testCase "lost response on a reused connection does not replay a billed POST" $ do
+        calls <- newIORef (0 :: Int)
+        let app request respond
+                | Wai.requestMethod request == methodGet = respond (Wai.responseLBS status200 [] "[]")
+                | otherwise = do
+                    _ <- Wai.strictRequestBody request
+                    atomicModifyIORef' calls (\n -> (n + 1, ()))
+                    -- Drop the connection after receiving the POST, before any
+                    -- response headers. A default http-client manager retries it.
+                    respond (Wai.responseRaw (\_ _ -> pure ()) (Wai.responseLBS status500 [] ""))
+        testWithApplication (pure app) $ \port -> do
+            client <- newClient defaultClientConfig {hubEndpoint = origin port, inferenceEndpoint = origin port} >>= expectRight
+            _ <- listModels client defaultListOptions >>= expectRight
+            result <- chatCompletion client (defaultChatRequest "owner/model" [userMessage "Hi"])
+            case result of
+                Left (TransportError _) -> pure ()
+                _ -> assertFailure (show result)
+            readIORef calls >>= (@?= 1)
+    , testCase "feature extraction uses explicit task route and batch" $ withFixture (jsonReply "[[0.1,0.2],[0.3,0.4]]") $ \client seen -> do
+        featureExtraction client repository ["one", "two"] >>= (@?= Right [[0.1,0.2],[0.3,0.4]])
+        requests <- seen
+        case requests of
+            [request] -> do
+                observedPath request @?= "/hf-inference/models/owner/model/pipeline/feature-extraction"
+                eitherDecode (observedBody request) @?= Right (object ["inputs" .= (["one", "two"] :: [Text])])
+            _ -> assertFailure (show requests)
+    , testGroup "generation response shapes"
+        [ testCase (show index) $ withFixture (jsonReply payload) $ \client seen -> do
+            textGeneration client repository "Hello" defaultGenerationParameters {generationMaxNewTokens = Just 4} >>= (@?= Right [GeneratedText "world" Nothing])
+            requests <- seen
+            case requests of
+                [request] -> do
+                    observedPath request @?= "/hf-inference/models/owner/model"
+                    eitherDecode (observedBody request) @?= Right (object ["inputs" .= ("Hello" :: Text), "parameters" .= object ["max_new_tokens" .= (4 :: Int)], "stream" .= False])
+                _ -> assertFailure (show requests)
+        | (index, payload) <- zip [1 :: Int ..] ["[{\"generated_text\":\"world\"}]", "{\"generated_text\":\"world\"}"] ]
+    , testGroup "classification response shapes"
+        [ testCase (show index) $ withFixture (jsonReply payload) $ \client _ ->
+            classifyText client repository "great" >>= (@?= Right [Classification "POSITIVE" 0.9])
+        | (index, payload) <- zip [1 :: Int ..] ["[{\"label\":\"POSITIVE\",\"score\":0.9}]", "[[{\"label\":\"POSITIVE\",\"score\":0.9}]]"] ]
+    , testCase "generic inference preserves custom JSON" $ withFixture (jsonReply "{\"answer\":42}") $ \client _ -> do
+        result <- infer client repository (object ["inputs" .= ("custom task" :: Text)]) :: IO (Either HuggingFaceError Value)
+        result @?= Right (object ["answer" .= (42 :: Int)])
+    ]
